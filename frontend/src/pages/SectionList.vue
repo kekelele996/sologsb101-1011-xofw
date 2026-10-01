@@ -2,11 +2,16 @@
 /**
  * 模块 2：/stations/:id/sections 断面测次列表与测法标记
  * 新增测次后回显当前水位；深链访问时若测站不存在给出友好空态。
+ *
+ * 外业 / 站上两侧分开：
+ * - 外业侧：录入测深、流速、流量，草稿 / 退回测次可「交回」站上复核；
+ * - 站上侧：对已交回测次做测法认定与定线发布（复核通过发新版本，退回则外业重试）。
+ * 两侧动过同一测次时流量按外业算、测法认定听站上，不互相覆盖。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Right, Timer } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Right, Timer, Upload, RefreshLeft, Check, Close } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
@@ -14,16 +19,38 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
-import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import { useRatingStore } from '@/stores/ratingStore'
+import {
+  MEASURE_METHODS,
+  SIDE_LABELS,
+  SURVEY_STATUS_LABELS,
+  SURVEY_STATUS_TAG_TYPE,
+  type MeasureMethod,
+  type Section,
+  type SurveySide,
+  type SurveyStatus
+} from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const ratingStore = useRatingStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
+
+/** 侧别 / 状态展示辅助（模板中不能直接引用类型，故用函数收窄） */
+function sideLabel(side: string): string {
+  return SIDE_LABELS[side as SurveySide] ?? side
+}
+function statusLabel(status: string): string {
+  return SURVEY_STATUS_LABELS[status as SurveyStatus] ?? status
+}
+function statusTagType(status: string): 'info' | 'warning' | 'success' | 'danger' {
+  return SURVEY_STATUS_TAG_TYPE[status as SurveyStatus] ?? 'info'
+}
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -35,6 +62,18 @@ const form = reactive({
   method: '流速仪' as MeasureMethod,
   measuredAt: new Date().toISOString().slice(0, 16)
 })
+
+/** 站上复核弹窗 */
+const reviewVisible = ref(false)
+const reviewSubmitting = ref(false)
+const reviewForm = reactive({
+  method: '流速仪' as MeasureMethod,
+  lineNo: 'A',
+  note: ''
+})
+const reviewingSection = ref<Section | null>(null)
+/** 待复核测次的外业断面流量（部分面积法） */
+const reviewDischarge = ref(0)
 
 const sectionRows = computed(() => {
   const list = sectionStore.sectionsOfStation(stationId.value)
@@ -148,6 +187,80 @@ async function removeSection(section: Section): Promise<void> {
   }
   await sectionStore.removeSection(section.id)
   ElMessage.success('测次及其垂线测点已删除')
+}
+
+/** 外业交回：草稿 / 退回 → 已交回，待站上复核 */
+async function submitSection(section: Section): Promise<void> {
+  const discharge = sectionStore.sectionDischarge(section.id)
+  try {
+    await ElMessageBox.confirm(
+      `将测次「${section.measureNo}」交回站上复核？交回后外业测点不可再改，断面流量 ${discharge.toFixed(2)} m³/s 按外业成果带入。`,
+      '交回确认',
+      { type: 'info', confirmButtonText: '交回站上', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  await sectionStore.submitSection(section.id)
+  ElMessage.success('测次已交回，等待站上复核')
+}
+
+/** 站上复核：打开复核弹窗，回显外业测法与断面流量 */
+function openReview(section: Section): void {
+  reviewingSection.value = section
+  reviewForm.method = section.methodObserved ?? section.method
+  reviewForm.lineNo = ratingStore.activeLineNo
+  reviewForm.note = ''
+  reviewDischarge.value = sectionStore.sectionDischarge(section.id)
+  reviewVisible.value = true
+}
+
+/** 站上复核通过：认定测法、生成关系点据、发布定线新版本 */
+async function approveReview(): Promise<void> {
+  if (!reviewingSection.value) return
+  if (!reviewForm.lineNo.trim()) {
+    ElMessage.warning('请填写定线号')
+    return
+  }
+  reviewSubmitting.value = true
+  try {
+    const section = reviewingSection.value
+    const lineNo = reviewForm.lineNo.trim()
+    // 测法认定听站上
+    await sectionStore.approveSection(section.id, { method: reviewForm.method, reviewNote: reviewForm.note || '复核通过，同意发布' })
+    // 流量按外业算：由断面流量生成关系点据
+    await ratingStore.upsertRatingFromSection(section, reviewDischarge.value, lineNo)
+    // 重新拟合，发新的一版
+    await ratingStore.publishVersion(lineNo, reviewForm.note || '复核通过，同意发布')
+    await ratingStore.rebuildCompares(lineNo)
+    ElMessage.success(`复核通过，${lineNo} 线已定线发布新版本`)
+    reviewVisible.value = false
+  } finally {
+    reviewSubmitting.value = false
+  }
+}
+
+/** 站上复核退回：外业留在原处重试，已发布版本照旧可查 */
+async function rejectReview(): Promise<void> {
+  if (!reviewingSection.value) return
+  if (!reviewForm.note.trim()) {
+    ElMessage.warning('请填写退回意见，外业据此重试')
+    return
+  }
+  reviewSubmitting.value = true
+  try {
+    await sectionStore.rejectSection(reviewingSection.value.id, reviewForm.note.trim())
+    ElMessage.success('已退回，外业留在原处重试')
+    reviewVisible.value = false
+  } finally {
+    reviewSubmitting.value = false
+  }
+}
+
+/** 外业重试：退回 → 草稿，不新建测次，原处修改后重新交回 */
+async function retrySection(section: Section): Promise<void> {
+  await sectionStore.retrySection(section.id)
+  ElMessage.success('已退回草稿，可在原处修改后重新交回')
 }
 
 function gotoVerticals(section: Section): void {
@@ -274,7 +387,21 @@ onMounted(() => {
 
       <el-table v-else :data="sectionRows" border stripe class="gb-table-compact">
         <el-table-column prop="measureNo" label="测次号" min-width="150" />
-        <el-table-column label="测法" width="110">
+        <el-table-column label="侧别" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.side === 'field' ? 'primary' : 'success'" effect="plain">
+              {{ sideLabel(row.side) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="statusTagType(row.status)" effect="dark">
+              {{ statusLabel(row.status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="测法认定" width="110">
           <template #default="{ row }">
             <el-tag size="small" :type="row.method === 'ADCP' ? 'success' : row.method === '浮标' ? 'warning' : 'primary'" effect="plain">
               {{ row.method }}
@@ -284,6 +411,11 @@ onMounted(() => {
         <el-table-column label="水位 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.stageM.toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="断面流量 (m³/s)" width="130" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ sectionStore.sectionDischarge(row.id).toFixed(2) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="起点距 (m)" width="120" align="right">
@@ -303,10 +435,31 @@ onMounted(() => {
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+            <el-button
+              v-if="row.status === 'draft' || row.status === 'rejected'"
+              size="small"
+              type="warning"
+              :icon="Upload"
+              @click="submitSection(row)"
+            >交回</el-button>
+            <el-button
+              v-if="row.status === 'rejected'"
+              size="small"
+              type="info"
+              :icon="RefreshLeft"
+              @click="retrySection(row)"
+            >重试</el-button>
+            <el-button
+              v-if="row.status === 'returned'"
+              size="small"
+              type="success"
+              :icon="Check"
+              @click="openReview(row)"
+            >复核</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -350,6 +503,41 @@ onMounted(() => {
         </el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="reviewVisible" title="站上复核 · 测法认定与定线发布" width="600px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        title="流量按外业算（部分面积法），测法认定听站上；复核通过才发新的一版，退回则外业留在原处重试。"
+        class="page__review-alert"
+      />
+      <el-descriptions :column="2" border size="small" class="page__review-desc">
+        <el-descriptions-item label="测次号">{{ reviewingSection?.measureNo }}</el-descriptions-item>
+        <el-descriptions-item label="外业观测测法">{{ reviewingSection?.methodObserved ?? reviewingSection?.method }}</el-descriptions-item>
+        <el-descriptions-item label="水位 (m)">{{ reviewingSection?.stageM.toFixed(2) }}</el-descriptions-item>
+        <el-descriptions-item label="外业断面流量 (m³/s)">
+          <span class="gb-mono">{{ reviewDischarge.toFixed(2) }}</span>
+        </el-descriptions-item>
+      </el-descriptions>
+      <el-form label-width="104px" class="page__review-form">
+        <el-form-item label="测法认定" required>
+          <el-radio-group v-model="reviewForm.method">
+            <el-radio-button v-for="method in MEASURE_METHODS" :key="method" :value="method">{{ method }}</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="定线号" required>
+          <el-input v-model="reviewForm.lineNo" placeholder="如 A / B / C" maxlength="8" />
+        </el-form-item>
+        <el-form-item label="复核意见">
+          <el-input v-model="reviewForm.note" type="textarea" :rows="2" placeholder="复核通过 / 退回原因" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="reviewVisible = false">取消</el-button>
+        <el-button type="danger" plain :icon="Close" :loading="reviewSubmitting" @click="rejectReview">退回外业重试</el-button>
+        <el-button type="success" :icon="Check" :loading="reviewSubmitting" @click="approveReview">复核通过并发布</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -386,5 +574,17 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__review-alert {
+  margin-bottom: 12px;
+}
+
+.page__review-desc {
+  margin-bottom: 12px;
+}
+
+.page__review-form {
+  margin-top: 4px;
 }
 </style>

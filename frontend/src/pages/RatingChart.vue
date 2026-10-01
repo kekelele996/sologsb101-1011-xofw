@@ -2,11 +2,14 @@
 /**
  * 模块 5：/ratings 水位流量关系点据与定线
  * 幂函数拟合 Q = a×(H-H0)^b、残差展示、超限点据挂红，并同步 URL query。
+ *
+ * 定线发布版本：站上拿全部点据重新拟合，复核通过才发新的一版；
+ * 已发布那版照旧可查，发布新版本时旧版本归档但不删除。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Refresh, TrendCharts, Upload, Clock } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
@@ -15,6 +18,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
 import { fitPowerCurve, type Rating, type RatingFitResult } from '@/types/rating'
+import { RATING_VERSION_STATUS_LABELS, type RatingVersion } from '@/types/ratingVersion'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -36,6 +40,18 @@ const form = reactive({
 
 const fit = computed(() => ratingStore.activeFit)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
+
+/** 当前定线号的已发布版本（已发布那版照旧可查） */
+const publishedVersion = computed<RatingVersion | null>(() =>
+  ratingStore.currentPublishedVersion(ratingStore.activeLineNo)
+)
+
+/** 当前定线号的全部版本（按版本号倒序） */
+const versionsForActiveLine = computed<RatingVersion[]>(() =>
+  ratingStore.versionsByLine(ratingStore.activeLineNo)
+)
+
+const versionsVisible = ref(false)
 
 /** 当前定线号下的点据（含曲线流量与残差） */
 const pointRows = computed(() =>
@@ -196,6 +212,38 @@ async function refit(): Promise<void> {
   }
 }
 
+/** 发布定线新版本：站上拿全部点据重新拟合，复核通过才发新的一版 */
+async function publishVersion(): Promise<void> {
+  const lineNo = ratingStore.activeLineNo
+  const points = ratingStore.ratings.filter((rating) => rating.lineNo === lineNo)
+  if (points.length < 3) {
+    ElMessage.warning('点据少于 3 个，无法定线发布（至少需要 3 个实测点）')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `将按当前 ${points.length} 个点据重新拟合并发布 ${lineNo} 线定线新版本？发布后旧版本归档但照旧可查。`,
+      '发布定线新版本',
+      { type: 'info', confirmButtonText: '发布新版本', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  const result = await ratingStore.publishVersion(lineNo, '站上复核通过，同意发布')
+  await ratingStore.rebuildCompares(lineNo)
+  if (result.valid) {
+    ElMessage.success(
+      `已发布 ${lineNo} 线 v${result.version}：Q = ${result.a}×(H-${result.h0})^${result.b}，平均残差 ${result.meanResidualPct}%`
+    )
+  } else {
+    ElMessage.warning('定线结果异常（指数 b ≤ 0），请检查点据后再发布')
+  }
+}
+
+function openVersions(): void {
+  versionsVisible.value = true
+}
+
 function handleLineChange(lineNo: string | number | boolean | undefined): void {
   ratingStore.setActiveLine(String(lineNo))
   void ratingStore.rebuildCompares(String(lineNo))
@@ -253,9 +301,33 @@ onMounted(() => {
           <el-option v-for="lineNo in lineNos" :key="lineNo" :label="`${lineNo} 线`" :value="lineNo" />
         </el-select>
         <el-button :icon="Refresh" @click="refit">重新定线</el-button>
+        <el-button type="success" :icon="Upload" @click="publishVersion">发布新版本</el-button>
+        <el-button :icon="Clock" @click="openVersions">版本历史</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增点据</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="publishedVersion"
+      type="success"
+      :closable="false"
+      class="page__published-alert"
+      :title="`当前已发布：${publishedVersion.lineNo} 线 v${publishedVersion.version}（${publishedVersion.publishedAt ? new Date(publishedVersion.publishedAt).toLocaleString('zh-CN') : ''}）Q = ${publishedVersion.a}×(H-${publishedVersion.h0})^${publishedVersion.b}，平均残差 ${publishedVersion.meanResidualPct}%`"
+    />
+    <el-alert
+      v-else-if="!fit.valid"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="fit.message || '当前定线号下点据不足，至少需要 3 个实测点才能定线'"
+    />
+    <el-alert
+      v-else
+      type="success"
+      show-icon
+      :closable="false"
+      :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
+    />
 
     <FilterBar
       :model-value="filterModel"
@@ -304,21 +376,6 @@ onMounted(() => {
         :icon="pointRows.some((row) => row.verdict === '超限') ? 'WarningFilled' : 'DataLine'"
       />
     </div>
-
-    <el-alert
-      v-if="!fit.valid"
-      type="warning"
-      show-icon
-      :closable="false"
-      :title="fit.message || '当前定线号下点据不足，至少需要 3 个实测点才能定线'"
-    />
-    <el-alert
-      v-else
-      type="success"
-      show-icon
-      :closable="false"
-      :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
-    />
 
     <div class="page__grid">
       <EmptyPanel
@@ -429,6 +486,44 @@ onMounted(() => {
         </el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="versionsVisible" :title="`${ratingStore.activeLineNo} 线 · 定线发布版本历史`" width="720px">
+      <el-alert
+        type="info"
+        :closable="false"
+        title="已发布那版照旧可查；发布新版本时旧版本归档但不删除。"
+        class="page__versions-alert"
+      />
+      <el-table :data="versionsForActiveLine" border stripe max-height="420">
+        <el-table-column label="版本" width="90" align="center">
+          <template #default="{ row }">
+            <span class="gb-mono">v{{ row.version }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.status === 'published' ? 'success' : 'info'" effect="dark">
+              {{ RATING_VERSION_STATUS_LABELS[row.status as keyof typeof RATING_VERSION_STATUS_LABELS] ?? row.status }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="定线参数" min-width="260">
+          <template #default="{ row }">
+            <span class="gb-mono">Q = {{ row.a }}×(H-{{ row.h0 }})^<span>{{ row.b }}</span></span>
+            <div class="gb-hint">{{ row.sampleCount }} 点 · 残差 {{ row.meanResidualPct }}% · R² {{ row.r2 }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="发布时间" width="170">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.publishedAt ? new Date(row.publishedAt).toLocaleString('zh-CN') : '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="note" label="复核意见" min-width="160" show-overflow-tooltip />
+      </el-table>
+      <template #footer>
+        <el-button @click="versionsVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -487,6 +582,14 @@ onMounted(() => {
 
 .page__full {
   width: 100%;
+}
+
+.page__published-alert {
+  margin-bottom: 4px;
+}
+
+.page__versions-alert {
+  margin-bottom: 12px;
 }
 
 @media (max-width: 1180px) {

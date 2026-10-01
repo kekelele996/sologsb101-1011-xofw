@@ -1,3 +1,5 @@
+import type { SurveySide } from './section'
+
 /** 流速测点：垂线上按相对水深布设的测速点 */
 export interface Point {
   id: string
@@ -11,6 +13,8 @@ export interface Point {
   weight: number
   /** 测速历时（s） */
   durationS: number
+  /** 侧别：流速测点归属外业侧 */
+  side: SurveySide
   createdAt: number
   updatedAt: number
 }

@@ -93,10 +93,13 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gbhydrogaug`，当前结构版本 `v2`。页面侧由 `frontend/src/utils/db.ts` 统一封装，页面组件不直接触碰 Dexie 实例。
-- **数据表**：`stations`（测站）、`sections`（断面测次）、`verticals`（垂线）、`points`（流速测点）、`ratings`（水位流量关系点据）、`compares`（比测记录）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与判定结论；调整字段结构时递增 `DB_VERSION` 并在 `upgrade` 中补迁移。
-- **首屏播种**：`initDatabase()` 在 `stations` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个测站 / 4 个断面测次 / 8 条垂线 / 16 个流速测点 / 13 个关系点据 / 13 条比测记录），其中 C 线含 2 个超限点据用于演示挂红与偏差分析。
+- **存储位置**：浏览器 IndexedDB，库名 `gbhydrogaug`，当前结构版本 `v3`。页面侧由 `frontend/src/utils/db.ts` 统一封装，页面组件不直接触碰 Dexie 实例。
+- **数据表**：`stations`（测站）、`sections`（断面测次）、`verticals`（垂线）、`points`（流速测点）、`ratings`（水位流量关系点据）、`compares`（比测记录）、`ratingVersions`（定线发布版本）。
+- **外业 / 站上两侧分开**：每张业务表带 `side` 侧别字段——`field` 外业（垂线测深、流速测点、断面流量）与 `station` 站上（测法认定、关系点据、定线发布版本）。两侧动过同一测次时各写各的字段：流量按外业算（部分面积法），测法认定听站上，不互相覆盖。
+- **测次交回工作流**：`sections.status` 记录 `draft`（草稿）→ `returned`（已交回）→ `published`（已发布）/ `rejected`（已退回）。外业交回后由站上拿全部点据重新拟合，复核通过才发新的一版；退回后外业留在原处重试，已发布那版照旧可查。
+- **定线发布版本**：`ratingVersions` 持久化每版定线成果（a / b / H0 / 残差 / R²）。发布新版本时旧版本归档但不删除，`currentPublishedVersion()` 取当前已发布版，`versionsByLine()` 查版本历史。
+- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2)` 补齐索引并回填时间戳与判定结论，`db.version(3)` 补侧别、交回状态并补建已发布定线版本；调整字段结构时递增 `DB_VERSION` 并在 `upgrade` 中补迁移。
+- **首屏播种**：`initDatabase()` 在 `stations` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个测站 / 4 个断面测次 / 8 条垂线 / 16 个流速测点 / 13 个关系点据 / 13 条比测记录 / 3 版定线发布版本），其中 C 线含 2 个超限点据用于演示挂红与偏差分析。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，store 里的列表自动刷新，无需手动处理刷新时机。
-- **备份与恢复**：`/export` 页可导出包含六张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」两种模式；备份时间写入 `localStorage`。
+- **备份与恢复**：`/export` 页可导出包含七张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」两种模式；备份时间写入 `localStorage`。
 - **离线可用**：应用为纯静态资源，无任何网络请求；换浏览器 / 清空站点数据后数据不会跟随，需通过 JSON 备份迁移。

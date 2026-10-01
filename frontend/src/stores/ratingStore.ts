@@ -1,5 +1,6 @@
 /**
- * 定线 store：维护水位流量关系点据、比测记录、定线参数与残差派生值。
+ * 定线 store：维护水位流量关系点据、比测记录、定线参数与残差派生值，
+ * 以及定线发布版本（外业 / 站上两侧分开：点据流量按外业，定线发布听站上）。
  * 供关系点据页（/ratings）与导出页（/export）共用。
  */
 import { defineStore } from 'pinia'
@@ -9,11 +10,14 @@ import type { Compare } from '@/types/compare'
 import { DEVIATION_LIMIT_PCT, calcDeviationPct, judgeDeviation, type CompareRow } from '@/types/compare'
 import type { Rating, RatingFitResult } from '@/types/rating'
 import { createEmptyRatingFilter, curveFlow, fitPowerCurve, type RatingFilterState } from '@/types/rating'
+import type { RatingVersion } from '@/types/ratingVersion'
 import type { Station } from '@/types/station'
+import type { Section } from '@/types/section'
 
 export const useRatingStore = defineStore('rating', () => {
   const ratings = ref<Rating[]>([])
   const compares = ref<Compare[]>([])
+  const ratingVersions = ref<RatingVersion[]>([])
   const stations = ref<Station[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
@@ -36,6 +40,9 @@ export const useRatingStore = defineStore('rating', () => {
     watchTable<Compare>(() => db.compares).subscribe((rows) => {
       compares.value = rows
     })
+    watchTable<RatingVersion>(() => db.ratingVersions).subscribe((rows) => {
+      ratingVersions.value = rows
+    })
     watchTable<Station>(() => db.stations).subscribe((rows) => {
       stations.value = rows
     })
@@ -45,6 +52,32 @@ export const useRatingStore = defineStore('rating', () => {
     const set = new Set<string>()
     ratings.value.forEach((rating) => set.add(rating.lineNo))
     return Array.from(set).sort((a, b) => a.localeCompare(b))
+  })
+
+  /** 某定线号的全部版本（按版本号倒序） */
+  function versionsByLine(lineNo: string): RatingVersion[] {
+    return ratingVersions.value
+      .filter((version) => version.lineNo === lineNo)
+      .sort((a, b) => b.version - a.version)
+  }
+
+  /** 某定线号当前已发布的版本（已发布那版照旧可查） */
+  function currentPublishedVersion(lineNo: string): RatingVersion | null {
+    return (
+      ratingVersions.value
+        .filter((version) => version.lineNo === lineNo && version.status === 'published')
+        .sort((a, b) => b.version - a.version)[0] ?? null
+    )
+  }
+
+  /** 全部定线号的当前已发布版本 */
+  const publishedVersionMap = computed<Record<string, RatingVersion>>(() => {
+    const map: Record<string, RatingVersion> = {}
+    lineNos.value.forEach((lineNo) => {
+      const current = currentPublishedVersion(lineNo)
+      if (current) map[lineNo] = current
+    })
+    return map
   })
 
   const stationNameOf = (stationId: string): string =>
@@ -167,10 +200,10 @@ export const useRatingStore = defineStore('rating', () => {
   }
 
   async function createRating(
-    payload: Omit<Rating, 'id' | 'createdAt' | 'updatedAt'>
+    payload: Omit<Rating, 'id' | 'createdAt' | 'updatedAt' | 'side'>
   ): Promise<Rating> {
     const now = Date.now()
-    const row: Rating = { ...payload, id: createId('rat'), createdAt: now, updatedAt: now }
+    const row: Rating = { ...payload, side: 'station', id: createId('rat'), createdAt: now, updatedAt: now }
     await db.ratings.put(row)
     return row
   }
@@ -215,6 +248,7 @@ export const useRatingStore = defineStore('rating', () => {
         verdict: judgeDeviation(deviationPct, deviationLimitPct.value),
         operator: existing?.operator ?? '林昭',
         comparedAt: existing?.comparedAt ?? rating.measuredAt,
+        side: 'station',
         createdAt: existing?.createdAt ?? now,
         updatedAt: now
       }
@@ -253,6 +287,102 @@ export const useRatingStore = defineStore('rating', () => {
     await db.compares.delete(id)
   }
 
+  /* --------------------------- 定线发布版本 --------------------------- */
+
+  /**
+   * 发布定线新版本：站上拿全部点据重新拟合，复核通过才发新的一版。
+   * 发布后旧版本归档但不删除（已发布那版照旧可查）。
+   */
+  async function publishVersion(lineNo: string, note = '复核通过，同意发布'): Promise<RatingVersion> {
+    const points = ratings.value
+      .filter((rating) => rating.lineNo === lineNo)
+      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+    const fit = fitPowerCurve(points, lineNo)
+    const now = Date.now()
+
+    // 版本号递增：同一定线号内最大版本号 +1
+    const maxVersion = ratingVersions.value
+      .filter((version) => version.lineNo === lineNo)
+      .reduce((max, version) => Math.max(max, version.version), 0)
+
+    const row: RatingVersion = {
+      id: createId('ratv'),
+      lineNo,
+      version: maxVersion + 1,
+      a: fit.a,
+      b: fit.b,
+      h0: fit.h0,
+      sampleCount: fit.sampleCount,
+      meanResidualPct: fit.meanResidualPct,
+      maxResidualPct: fit.maxResidualPct,
+      r2: fit.r2,
+      valid: fit.valid,
+      status: 'published',
+      side: 'station',
+      note,
+      publishedAt: new Date(now).toISOString(),
+      createdAt: now,
+      updatedAt: now
+    }
+
+    await db.transaction('rw', [db.ratingVersions], async () => {
+      // 旧的已发布版本归档（不删除，照旧可查）
+      const oldPublished = ratingVersions.value.filter(
+        (version) => version.lineNo === lineNo && version.status === 'published'
+      )
+      for (const old of oldPublished) {
+        await db.ratingVersions.update(old.id, { status: 'archived', updatedAt: now } as never)
+      }
+      await db.ratingVersions.put(row)
+    })
+
+    setFit(fit)
+    return row
+  }
+
+  /**
+   * 由外业测次成果生成 / 更新关系点据：流量按外业算（部分面积法断面流量），
+   * 测法认定听站上。同一测次（measureNo）的点据只保留一条，重复交回不覆盖。
+   */
+  async function upsertRatingFromSection(
+    section: Section,
+    dischargeM3s: number,
+    lineNo: string
+  ): Promise<Rating> {
+    const now = Date.now()
+    const existing = ratings.value.find(
+      (rating) => rating.stationId === section.stationId && rating.measureNo === section.measureNo
+    )
+    if (existing) {
+      await db.ratings.update(
+        existing.id,
+        {
+          stageM: section.stageM,
+          flowM3s: dischargeM3s,
+          lineNo,
+          measuredAt: section.measuredAt,
+          side: 'station',
+          updatedAt: now
+        } as never
+      )
+      return { ...existing, stageM: section.stageM, flowM3s: dischargeM3s, lineNo, updatedAt: now }
+    }
+    const row: Rating = {
+      id: createId('rat'),
+      stationId: section.stationId,
+      stageM: section.stageM,
+      flowM3s: dischargeM3s,
+      lineNo,
+      measureNo: section.measureNo,
+      measuredAt: section.measuredAt,
+      side: 'station',
+      createdAt: now,
+      updatedAt: now
+    }
+    await db.ratings.put(row)
+    return row
+  }
+
   return {
     ratings,
     compares,
@@ -285,6 +415,12 @@ export const useRatingStore = defineStore('rating', () => {
     rebuildCompares,
     createCompare,
     updateCompare,
-    removeCompare
+    removeCompare,
+    ratingVersions,
+    versionsByLine,
+    currentPublishedVersion,
+    publishedVersionMap,
+    publishVersion,
+    upsertRatingFromSection
   }
 })

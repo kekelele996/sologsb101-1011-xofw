@@ -2,6 +2,8 @@
  * 流量计算工具：垂线加权平均流速、部分面积法与断面流量计算。
  * 页面、store 与数据库播种共用同一套算法，保证展示值与存储值一致。
  */
+import type { Point } from '@/types/point'
+import type { Vertical } from '@/types/vertical'
 
 /** 默认计算权重：一点法 1.0、两点法 0.5/0.5、三点法 1/3、五点法 0.2 */
 export const DEFAULT_WEIGHTS: number[] = [1, 0.5, 1 / 3, 0.25, 0.2]
@@ -145,4 +147,34 @@ export function velocityFromRevolutions(revolutions: number, durationS: number, 
 export function powerFlow(a: number, b: number, h0: number, stageM: number): number {
   if (!Number.isFinite(a) || !Number.isFinite(b)) return 0
   return round(a * Math.pow(Math.max(stageM - h0, 1e-6), b), 2)
+}
+
+/**
+ * 由某测次的垂线与测点构建部分面积法输入：
+ * 每条垂线的平均流速由其测点按权重加权得到。
+ */
+export function buildVerticalSlices(
+  verticals: Vertical[],
+  pointsOfVertical: (verticalId: string) => Point[]
+): VerticalSlice[] {
+  return verticals.map((vertical) => {
+    const meanVelocityMs = calcMeanVelocity(
+      pointsOfVertical(vertical.id).map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+    )
+    return {
+      id: vertical.id,
+      no: vertical.no,
+      startDistanceM: vertical.startDistanceM,
+      depthM: vertical.depthM,
+      meanVelocityMs
+    }
+  })
+}
+
+/** 计算某测次的断面流量（外业成果）：部分面积法 */
+export function computeSectionDischarge(
+  verticals: Vertical[],
+  pointsOfVertical: (verticalId: string) => Point[]
+): DischargeResult {
+  return calcSectionDischarge(buildVerticalSlices(verticals, pointsOfVertical))
 }

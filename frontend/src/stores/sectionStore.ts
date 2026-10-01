@@ -1,15 +1,22 @@
 /**
  * 断面 store：维护断面测次、垂线集合、测点缓存与录入草稿。
  * 垂线排序按起点距升序，页面展示与流量计算共用同一顺序。
+ *
+ * 外业 / 站上两侧分开：
+ * - 外业侧（side='field'）管测深、流速、流量：垂线、测点、断面流量由外业录入与计算。
+ * - 站上侧（side='station'）管测法认定与定线发布：测法认证、关系点据、定线版本。
+ * 两侧动过同一测次时各写各的字段，流量按外业算，测法认定听站上，不互相覆盖。
+ * 交回工作流：草稿 → 已交回 → 已发布 / 已退回；退回后外业留在原处重试。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
-import type { Section } from '@/types/section'
+import type { Section, SurveyStatus } from '@/types/section'
 import { createEmptySectionFilter, type SectionFilterState } from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import { computeSectionDischarge } from '@/utils/flow'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -179,10 +186,30 @@ export const useSectionStore = defineStore('section', () => {
   /* ------------------------------ 断面测次 ------------------------------ */
 
   async function createSection(
-    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt'>
+    payload: Omit<
+      Section,
+      | 'id'
+      | 'createdAt'
+      | 'updatedAt'
+      | 'side'
+      | 'status'
+      | 'methodObserved'
+      | 'methodCertifiedAt'
+      | 'returnedAt'
+      | 'reviewedAt'
+      | 'reviewNote'
+    >
   ): Promise<Section> {
     const now = Date.now()
-    const row: Section = { ...payload, id: createId('sec'), createdAt: now, updatedAt: now }
+    const row: Section = {
+      ...payload,
+      id: createId('sec'),
+      side: 'field',
+      status: 'draft',
+      methodObserved: payload.method,
+      createdAt: now,
+      updatedAt: now
+    }
     await db.sections.put(row)
     return row
   }
@@ -206,10 +233,10 @@ export const useSectionStore = defineStore('section', () => {
 
   async function createVertical(
     sectionId: string,
-    payload: Omit<Vertical, 'id' | 'createdAt' | 'updatedAt' | 'sectionId'>
+    payload: Omit<Vertical, 'id' | 'createdAt' | 'updatedAt' | 'sectionId' | 'side'>
   ): Promise<Vertical> {
     const now = Date.now()
-    const row: Vertical = { ...payload, sectionId, id: createId('vrt'), createdAt: now, updatedAt: now }
+    const row: Vertical = { ...payload, sectionId, side: 'field', id: createId('vrt'), createdAt: now, updatedAt: now }
     await db.verticals.put(row)
     // 录入测深后按相对水深自动生成测点行
     const depths = buildRelativeDepths(payload.pointCount)
@@ -220,6 +247,7 @@ export const useSectionStore = defineStore('section', () => {
       velocityMs: 0.5,
       weight: Number((1 / depths.length).toFixed(4)),
       durationS: 100,
+      side: 'field',
       createdAt: now + index,
       updatedAt: now + index
     }))
@@ -252,6 +280,7 @@ export const useSectionStore = defineStore('section', () => {
         velocityMs: match?.velocityMs ?? 0.5,
         weight: Number((1 / depths.length).toFixed(4)),
         durationS: match?.durationS ?? 100,
+        side: 'field',
         createdAt: match?.createdAt ?? now + index,
         updatedAt: now + index
       }
@@ -268,10 +297,10 @@ export const useSectionStore = defineStore('section', () => {
 
   async function createPoint(
     verticalId: string,
-    payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'verticalId'>
+    payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'verticalId' | 'side'>
   ): Promise<Point> {
     const now = Date.now()
-    const row: Point = { ...payload, verticalId, id: createId('pnt'), createdAt: now, updatedAt: now }
+    const row: Point = { ...payload, verticalId, side: 'field', id: createId('pnt'), createdAt: now, updatedAt: now }
     await db.points.put(row)
     await syncVerticalPointCount(verticalId)
     return row
@@ -313,6 +342,7 @@ export const useSectionStore = defineStore('section', () => {
       velocityMs: row.velocityMs,
       weight: Number((1 / rows.length).toFixed(4)),
       durationS: row.durationS,
+      side: 'field',
       createdAt: now + index,
       updatedAt: now + index
     }))
@@ -336,6 +366,94 @@ export const useSectionStore = defineStore('section', () => {
     const weight = Number((1 / rows.length).toFixed(4))
     await db.points.bulkPut(rows.map((row) => ({ ...row, weight, updatedAt: Date.now() })))
     return rows.length
+  }
+
+  /* --------------------------- 外业 / 站上 交回工作流 --------------------------- */
+
+  /** 某测次的断面流量（外业成果）：由其垂线与测点按部分面积法计算 */
+  function sectionDischarge(sectionId: string): number {
+    const sectionVerticalList = verticalsOfSection(sectionId)
+    if (sectionVerticalList.length === 0) return 0
+    return computeSectionDischarge(sectionVerticalList, pointsOfVertical).flowM3s
+  }
+
+  /** 按交回状态筛选测次 */
+  function sectionsByStatus(status: SurveyStatus): Section[] {
+    return sections.value
+      .filter((section) => section.status === status)
+      .sort((a, b) => Date.parse(b.measuredAt) - Date.parse(a.measuredAt))
+  }
+
+  /** 已交回待站上复核的测次 */
+  const returnedSections = computed<Section[]>(() => sectionsByStatus('returned'))
+
+  /** 已发布的测次 */
+  const publishedSections = computed<Section[]>(() => sectionsByStatus('published'))
+
+  /** 已退回待外业重试的测次 */
+  const rejectedSections = computed<Section[]>(() => sectionsByStatus('rejected'))
+
+  /**
+   * 外业交回：草稿 / 退回 → 已交回。
+   * 交回后测次由站上接管复核，外业不可再改测点（已发布版本照旧可查）。
+   */
+  async function submitSection(sectionId: string): Promise<void> {
+    const now = Date.now()
+    await db.sections.update(
+      sectionId,
+      { status: 'returned', returnedAt: new Date(now).toISOString(), updatedAt: now } as never
+    )
+  }
+
+  /**
+   * 站上复核通过：认定测法、写入复核意见，测次状态 → 已发布。
+   * 测法认定听站上：外业改测点不影响站上认定的测法。
+   */
+  async function approveSection(
+    sectionId: string,
+    payload: { method: Section['method']; reviewNote?: string }
+  ): Promise<void> {
+    const now = Date.now()
+    await db.sections.update(
+      sectionId,
+      {
+        method: payload.method,
+        methodCertifiedAt: new Date(now).toISOString(),
+        status: 'published',
+        reviewedAt: new Date(now).toISOString(),
+        reviewNote: payload.reviewNote ?? '复核通过，同意发布',
+        updatedAt: now
+      } as never
+    )
+  }
+
+  /**
+   * 站上复核退回：测次状态 → 已退回，外业留在原处重试。
+   * 已发布那版照旧可查，不受退回影响。
+   */
+  async function rejectSection(sectionId: string, reviewNote: string): Promise<void> {
+    const now = Date.now()
+    await db.sections.update(
+      sectionId,
+      {
+        status: 'rejected',
+        reviewedAt: new Date(now).toISOString(),
+        reviewNote,
+        updatedAt: now
+      } as never
+    )
+  }
+
+  /**
+   * 外业重试：退回 → 草稿，外业在原处修改测深 / 流速 / 流量后重新交回。
+   * 不新建测次，已发布版本照旧可查。
+   */
+  async function retrySection(sectionId: string): Promise<void> {
+    const now = Date.now()
+    await db.sections.update(
+      sectionId,
+      { status: 'draft', returnedAt: undefined, reviewedAt: undefined, reviewNote: undefined, updatedAt: now } as never
+    )
   }
 
   return {
@@ -379,6 +497,14 @@ export const useSectionStore = defineStore('section', () => {
     bulkSetVelocity,
     importPointDrafts,
     syncVerticalPointCount,
-    normalizeWeights
+    normalizeWeights,
+    sectionDischarge,
+    returnedSections,
+    publishedSections,
+    rejectedSections,
+    submitSection,
+    approveSection,
+    rejectSection,
+    retrySection
   }
 })

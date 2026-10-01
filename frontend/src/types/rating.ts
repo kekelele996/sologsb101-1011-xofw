@@ -1,4 +1,6 @@
 /** 水位流量关系点据：参与幂函数定线的实测点 */
+import type { SurveySide } from './section'
+
 export interface Rating {
   id: string
   /** 所属测站 */
@@ -13,6 +15,8 @@ export interface Rating {
   measureNo: string
   /** 点据时间 */
   measuredAt: string
+  /** 侧别：关系点据归属站上侧 */
+  side: SurveySide
   createdAt: number
   updatedAt: number
 }

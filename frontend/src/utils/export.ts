@@ -11,9 +11,10 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import type { RatingVersion } from '@/types/ratingVersion'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares', 'ratingVersions'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,13 +22,14 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, ratingVersions] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.ratingVersions.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +40,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    ratingVersions
   }
 }
 
@@ -65,7 +68,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    // 兼容旧备份：无定线版本时补空数组，导入后由迁移 / 发布流程补建
+    ratingVersions: Array.isArray(obj.ratingVersions) ? (obj.ratingVersions as RatingVersion[]) : []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +83,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    ratingVersions: payload.ratingVersions.length
   }
 }
 
@@ -114,19 +120,26 @@ export function readFileText(file: File): Promise<string> {
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
+  // 兼容旧备份：补侧别（外业 / 站上），避免导入后拿到 undefined
+  const sections = payload.sections.map((section) => ({ ...section, side: section.side ?? 'field' }))
+  const verticals = payload.verticals.map((vertical) => ({ ...vertical, side: vertical.side ?? 'field' }))
+  const points = payload.points.map((point) => ({ ...point, side: point.side ?? 'field' }))
+  const ratings = payload.ratings.map((rating) => ({ ...rating, side: rating.side ?? 'station' }))
+  const compares = payload.compares.map((compare) => ({ ...compare, side: compare.side ?? 'station' }))
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.ratingVersions],
     async () => {
       await db.stations.bulkPut(payload.stations)
-      await db.sections.bulkPut(payload.sections)
-      await db.verticals.bulkPut(payload.verticals)
-      await db.points.bulkPut(payload.points)
-      await db.ratings.bulkPut(payload.ratings)
-      await db.compares.bulkPut(payload.compares)
+      await db.sections.bulkPut(sections)
+      await db.verticals.bulkPut(verticals)
+      await db.points.bulkPut(points)
+      await db.ratings.bulkPut(ratings)
+      await db.compares.bulkPut(compares)
+      await db.ratingVersions.bulkPut(payload.ratingVersions)
     }
   )
-  return countPayload(payload)
+  return countPayload({ ...payload, sections, verticals, points, ratings, compares })
 }
 
 /** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
@@ -166,7 +179,11 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  const ratingVersions = payload.ratingVersions.map((version) => ({
+    ...version,
+    id: createId('ratv')
+  }))
+  return { ...payload, stations, sections, verticals, points, ratings, compares, ratingVersions }
 }
 
 /**

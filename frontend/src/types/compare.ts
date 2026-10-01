@@ -1,3 +1,4 @@
+import type { SurveySide } from './section'
 import type { Rating } from './rating'
 
 /** 比测判定结论 */
@@ -23,6 +24,8 @@ export interface Compare {
   operator: string
   /** 比测日期 */
   comparedAt: string
+  /** 侧别：比测分析归属站上侧 */
+  side: SurveySide
   createdAt: number
   updatedAt: number
 }

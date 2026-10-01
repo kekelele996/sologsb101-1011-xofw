@@ -1,3 +1,5 @@
+import type { SurveySide } from './section'
+
 /** 垂线：断面上的测速垂线，测深后按相对水深生成测点 */
 export interface Vertical {
   id: string
@@ -13,6 +15,8 @@ export interface Vertical {
   pointCount: number
   /** 测深备注（河床质、流向等） */
   bedNote: string
+  /** 侧别：垂线测深归属外业侧 */
+  side: SurveySide
   createdAt: number
   updatedAt: number
 }
