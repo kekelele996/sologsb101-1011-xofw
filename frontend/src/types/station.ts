@@ -1,7 +1,9 @@
 /** 水位流量关系点据的定线编号（可多条并存，用于区分不同年份的绳套曲线） */
+import type { WorkSide } from './side'
+
 export const LINE_NOS = ['A', 'B', 'C'] as const
 
-/** 测站：水文测验的基本单元 */
+/** 测站：水文测验的基本单元（站上侧台账） */
 export interface Station {
   id: string
   /** 站名 */
@@ -14,6 +16,8 @@ export interface Station {
   sectionCode: string
   /** 备注 */
   remark: string
+  /** 归属侧：测站台账由站上维护，升级旧库时补 station */
+  side: WorkSide
   createdAt: number
   updatedAt: number
 }

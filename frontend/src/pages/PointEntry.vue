@@ -15,6 +15,7 @@ import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { parsePointPaste } from '@/types/point'
 import type { Point } from '@/types/point'
+import { HANDOFF_STATUS_LABEL, HANDOFF_STATUS_TAG_TYPE, isFieldEditable } from '@/types/handoff'
 import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
@@ -27,6 +28,9 @@ const verticalId = computed(() => String(route.params.id ?? ''))
 const vertical = computed(() => sectionStore.verticals.find((item) => item.id === verticalId.value) ?? null)
 const section = computed(() => (vertical.value ? sectionStore.sectionById(vertical.value.sectionId) : null))
 const station = computed(() => (section.value ? stationStore.stationById(section.value.stationId) : null))
+
+/** 外业是否仍可改流速（draft / returned 可改） */
+const editable = computed(() => (section.value ? isFieldEditable(section.value.handoffStatus) : false))
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -105,6 +109,10 @@ function openEdit(point: Point): void {
 }
 
 async function submitForm(): Promise<void> {
+  if (!editable.value) {
+    ElMessage.warning('测次已交回站上，测点流速冻结，外业侧只读')
+    return
+  }
   if (!Number.isFinite(form.relativeDepth) || form.relativeDepth < 0 || form.relativeDepth > 1) {
     ElMessage.warning('相对水深应在 0 ~ 1 之间（0 为水面、1 为河底）')
     return
@@ -133,6 +141,10 @@ async function submitForm(): Promise<void> {
 }
 
 async function removePoint(point: Point): Promise<void> {
+  if (!editable.value) {
+    ElMessage.info('测次交回后测点冻结，不能删除')
+    return
+  }
   try {
     await ElMessageBox.confirm(
       `删除相对水深 ${point.relativeDepth} 处的测点？删除后垂线平均流速与断面流量会重新计算。`,
@@ -162,6 +174,10 @@ function previewPaste(): void {
 }
 
 async function importPaste(): Promise<void> {
+  if (!editable.value) {
+    ElMessage.info('测次交回后测点冻结，不能导入')
+    return
+  }
   const parsed = parsePointPaste(pasteText.value)
   pasteErrors.value = parsed.errors
   if (parsed.rows.length === 0) {
@@ -183,6 +199,10 @@ async function importPaste(): Promise<void> {
 }
 
 async function applyBulkVelocity(): Promise<void> {
+  if (!editable.value) {
+    ElMessage.info('测次交回后测点冻结，不能批量改写')
+    return
+  }
   if (bulkVelocity.value === null || !Number.isFinite(bulkVelocity.value)) {
     ElMessage.warning('请填写要批量写入的流速值')
     return
@@ -201,6 +221,10 @@ async function applyBulkVelocity(): Promise<void> {
 }
 
 async function doNormalize(): Promise<void> {
+  if (!editable.value) {
+    ElMessage.info('测次交回后测点冻结，不能调整权重')
+    return
+  }
   const count = await sectionStore.normalizeWeights(verticalId.value)
   ElMessage.success(`已按 ${count} 个测点平均分配计算权重`)
 }
@@ -255,14 +279,25 @@ onMounted(() => {
           </el-breadcrumb>
           <h2 class="page__title">
             垂线 {{ vertical.no }} · 流速测点录入
+            <el-tag
+              v-if="section"
+              size="small"
+              :type="HANDOFF_STATUS_TAG_TYPE[section.handoffStatus]"
+              effect="plain"
+            >{{ HANDOFF_STATUS_LABEL[section.handoffStatus] }}</el-tag>
             <el-tag size="small" effect="plain">起点距 {{ vertical.startDistanceM.toFixed(1) }} m</el-tag>
             <el-tag size="small" type="info" effect="plain">水深 {{ vertical.depthM.toFixed(2) }} m</el-tag>
           </h2>
           <p class="gb-hint">
-            逐点录入相对水深与流速，权重参与加权平均；同一垂线的平均流速乘以部分面积得到部分流量，最终汇总为断面流量。
+            <template v-if="editable">
+              逐点录入相对水深与流速，权重参与加权平均；同一垂线的平均流速乘以部分面积得到部分流量，最终汇总为断面流量，交回时固化。
+            </template>
+            <template v-else>
+              该测次已交回站上，流速测点外业只读；流量以交回固化成果为准，站上定线发布不会改写此处数值。
+            </template>
           </p>
         </div>
-        <div class="page__actions">
+        <div v-if="editable" class="page__actions">
           <el-button :icon="MagicStick" @click="doNormalize">权重归一</el-button>
           <el-button :icon="DocumentCopy" @click="openPaste">批量粘贴</el-button>
           <el-button type="primary" :icon="Plus" @click="openCreate">新增测点</el-button>
@@ -282,7 +317,7 @@ onMounted(() => {
         />
       </div>
 
-      <el-card shadow="never" class="gb-panel">
+      <el-card v-if="editable" shadow="never" class="gb-panel">
         <div class="gb-panel-title">
           <h3>批量录入</h3>
           <span class="gb-hint">适合野外手记数据一次性录入：改写流速或按「相对水深,流速[,历时]」整行导入。</span>
@@ -334,8 +369,11 @@ onMounted(() => {
           </el-table-column>
           <el-table-column label="操作" width="170" fixed="right">
             <template #default="{ row }">
-              <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" type="danger" plain :icon="Delete" @click="removePoint(row)">删除</el-button>
+              <template v-if="editable">
+                <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+                <el-button size="small" type="danger" plain :icon="Delete" @click="removePoint(row)">删除</el-button>
+              </template>
+              <el-tag v-else size="small" type="info" effect="plain">外业只读</el-tag>
             </template>
           </el-table-column>
         </el-table>

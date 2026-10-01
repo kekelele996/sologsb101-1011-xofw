@@ -1,16 +1,20 @@
-/** 流速测点：垂线上按相对水深布设的测速点 */
+/** 流速测点：垂线上按相对水深布设的测速点（外业侧） */
+import type { WorkSide } from './side'
+
 export interface Point {
   id: string
   /** 所属垂线 */
   verticalId: string
   /** 相对水深：0 为水面、1 为河底 */
   relativeDepth: number
-  /** 测点流速（m/s） */
+  /** 测点流速（m/s）——外业测速 */
   velocityMs: number
   /** 计算权重（垂直流速分布加权系数） */
   weight: number
   /** 测速历时（s） */
   durationS: number
+  /** 归属侧：流速归外业，升级旧库时补 field */
+  side: WorkSide
   createdAt: number
   updatedAt: number
 }

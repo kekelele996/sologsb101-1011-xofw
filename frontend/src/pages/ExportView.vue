@@ -71,14 +71,17 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
+  // 结论中的定线参数取站上当前发布版本（未发布的线按点据临时拟合并标注）
+  const fits = ratingStore.lineNos.map((lineNo) => {
+    const published = ratingStore.currentVersionOf(lineNo)
+    if (published) return published.fit
+    return fitPowerCurve(
       payload.ratings
         .filter((rating) => rating.lineNo === lineNo)
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
       lineNo
     )
-  )
+  })
   conclusions.value = buildConclusionLines(payload, fits)
 }
 
@@ -135,7 +138,7 @@ async function handleImport(): Promise<void> {
 async function handleReset(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      '将清空全部本地数据并重新播种演示数据（测站、断面、垂线、测点、点据、比测）。确认继续？',
+      '将清空全部本地数据并重新播种演示数据（测站、测次交回、垂线测点、点据、比测、定线版本）。确认继续？',
       '重置本地数据',
       { type: 'warning', confirmButtonText: '清空并重建', cancelButtonText: '取消' }
     )
@@ -149,10 +152,9 @@ async function handleReset(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
-  await ratingStore.rebuildCompares(ratingStore.activeLineNo)
   await refreshCounts()
   await buildConclusions()
-  ElMessage.success('已重新定线并刷新结构版本信息')
+  ElMessage.success('已按当前发布版本刷新结构版本信息')
 }
 
 onMounted(() => {
@@ -172,7 +174,7 @@ onMounted(() => {
         </p>
       </div>
       <div class="page__actions">
-        <el-button :icon="Refresh" @click="refreshAll">重新定线并刷新</el-button>
+        <el-button :icon="Refresh" @click="refreshAll">刷新</el-button>
         <el-button type="primary" :icon="Download" :loading="exporting" @click="handleExport">导出 JSON</el-button>
       </div>
     </div>
@@ -290,7 +292,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / ratingVersions 七张表（含两侧字段与定线版本快照）
         </span>
       </div>
 
@@ -331,8 +333,8 @@ onMounted(() => {
         <el-descriptions-item label="垂线 / 测点">
           {{ counts.verticals ?? 0 }} / {{ counts.points ?? 0 }}
         </el-descriptions-item>
-        <el-descriptions-item label="点据 / 比测">
-          {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        <el-descriptions-item label="点据 / 比测 / 版本">
+          {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }} / {{ counts.ratingVersions ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

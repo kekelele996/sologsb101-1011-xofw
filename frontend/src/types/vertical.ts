@@ -1,4 +1,6 @@
-/** 垂线：断面上的测速垂线，测深后按相对水深生成测点 */
+/** 垂线：断面上的测速垂线，测深后按相对水深生成测点（外业侧） */
+import type { WorkSide } from './side'
+
 export interface Vertical {
   id: string
   /** 所属断面测次 */
@@ -7,12 +9,14 @@ export interface Vertical {
   no: number
   /** 起点距（m） */
   startDistanceM: number
-  /** 水深（m） */
+  /** 水深（m）——外业测深 */
   depthM: number
   /** 测点数（由测点行实时回填） */
   pointCount: number
   /** 测深备注（河床质、流向等） */
   bedNote: string
+  /** 归属侧：测深归外业，升级旧库时补 field */
+  side: WorkSide
   createdAt: number
   updatedAt: number
 }

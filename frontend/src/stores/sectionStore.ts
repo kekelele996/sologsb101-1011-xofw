@@ -1,6 +1,9 @@
 /**
  * 断面 store：维护断面测次、垂线集合、测点缓存与录入草稿。
  * 垂线排序按起点距升序，页面展示与流量计算共用同一顺序。
+ *
+ * 两侧分工：外业（field）写测次采集字段、垂线测深、测点流速与流量快照；
+ * 站上（station）侧的测法认定 / 定线发布走 utils/handoff.ts 与 ratingStore。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
@@ -10,6 +13,8 @@ import { createEmptySectionFilter, type SectionFilterState } from '@/types/secti
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import { isFieldEditable, isPendingReview } from '@/types/handoff'
+import { pickFieldSectionPatch, saveFieldFlowSnapshot } from '@/utils/handoff'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -84,11 +89,12 @@ export const useSectionStore = defineStore('section', () => {
         if (currentSectionId.value && section.id === currentSectionId.value) return true
         const keyword = filter.value.keyword.trim()
         if (keyword.length > 0) {
-          const haystack = `${section.measureNo}${section.method}`
+          const haystack = `${section.measureNo}${section.method}${section.determinedMethod ?? ''}`
           if (!haystack.includes(keyword)) return false
         }
         if (filter.value.methods.length > 0 && !filter.value.methods.includes(section.method)) return false
         if (filter.value.minStageM !== null && section.stageM < filter.value.minStageM) return false
+        if (filter.value.statuses.length > 0 && !filter.value.statuses.includes(section.handoffStatus)) return false
         return true
       })
       .sort((a, b) => Date.parse(b.measuredAt) - Date.parse(a.measuredAt))
@@ -96,6 +102,26 @@ export const useSectionStore = defineStore('section', () => {
 
   const sectionById = (id: string | null | undefined): Section | null =>
     id ? sections.value.find((section) => section.id === id) ?? null : null
+
+  /** 外业工作台：仍在原处（编辑中 / 退回重试）的测次 */
+  const fieldOwnedSections = computed<Section[]>(() =>
+    sections.value.filter((section) => isFieldEditable(section.handoffStatus))
+  )
+
+  /** 站上复核台：已交回待复核的测次 */
+  const pendingReviewSections = computed<Section[]>(() =>
+    sections.value.filter((section) => isPendingReview(section.handoffStatus))
+  )
+
+  /** 站上已采用（其点据已进入定线）的测次 */
+  const acceptedSections = computed<Section[]>(() =>
+    sections.value.filter((section) => section.handoffStatus === 'accepted')
+  )
+
+  function isSectionEditable(id: string | null | undefined): boolean {
+    const section = sectionById(id)
+    return !!section && isFieldEditable(section.handoffStatus)
+  }
 
   /** 某断面下的垂线：按起点距升序（起点距排序校验的基础） */
   function verticalsOfSection(sectionId: string | null | undefined): Vertical[] {
@@ -176,22 +202,58 @@ export const useSectionStore = defineStore('section', () => {
     pointDraft.value = createEmptyPointDraft()
   }
 
-  /* ------------------------------ 断面测次 ------------------------------ */
+  /* ------------------------------ 断面测次（外业侧） ------------------------------ */
 
   async function createSection(
-    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt'>
+    payload: Pick<
+      Section,
+      'stationId' | 'measureNo' | 'startDistanceM' | 'stageM' | 'method' | 'measuredAt'
+    > &
+      Partial<Pick<Section, 'targetLineNo' | 'handoffNote'>>
   ): Promise<Section> {
     const now = Date.now()
-    const row: Section = { ...payload, id: createId('sec'), createdAt: now, updatedAt: now }
+    const row: Section = {
+      ...payload,
+      id: createId('sec'),
+      side: 'field',
+      handoffStatus: 'draft',
+      fieldFlowM3s: 0,
+      fieldAreaM2: 0,
+      fieldMeanVelocityMs: 0,
+      targetLineNo: payload.targetLineNo || 'A',
+      handedAt: null,
+      handoffNote: payload.handoffNote ?? '',
+      returnedAt: null,
+      returnReason: '',
+      returnCount: 0,
+      determinedMethod: null,
+      determinedAt: null,
+      determinedBy: '',
+      determinationNote: '',
+      acceptedLineNo: '',
+      acceptedVersionId: null,
+      acceptedAt: null,
+      createdAt: now,
+      updatedAt: now
+    }
     await db.sections.put(row)
     return row
   }
 
+  /** 外业更新测次：白名单剔除站上字段；已交回测次只读 */
   async function updateSection(id: string, patch: Partial<Section>): Promise<void> {
-    await db.sections.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const current = await db.sections.get(id)
+    if (current && !isFieldEditable(current.handoffStatus)) {
+      throw new Error('测次已交回站上，外业侧只读；退回后或申请修订后才能修改')
+    }
+    await db.sections.update(id, { ...pickFieldSectionPatch(patch), updatedAt: Date.now() } as never)
   }
 
   async function removeSection(id: string): Promise<void> {
+    const current = await db.sections.get(id)
+    if (current && !isFieldEditable(current.handoffStatus)) {
+      throw new Error('测次已交回或已采用，不能直接删除；请先由站上退回')
+    }
     await db.transaction('rw', [db.sections, db.verticals, db.points], async () => {
       const verticalIds = (await db.verticals.where('sectionId').equals(id).toArray()).map((row) => row.id)
       if (verticalIds.length > 0) {
@@ -202,14 +264,39 @@ export const useSectionStore = defineStore('section', () => {
     })
   }
 
-  /* ------------------------------- 垂线 ------------------------------- */
+  /* ------------------------------- 垂线 / 测点（外业侧） ------------------------------- */
+
+  /** 取垂线所属测次，校验外业是否仍可改 */
+  async function requireEditableByVertical(verticalId: string): Promise<Section> {
+    const vertical = await db.verticals.get(verticalId)
+    if (!vertical) throw new Error('垂线不存在')
+    const section = await db.sections.get(vertical.sectionId)
+    if (!section) throw new Error('所属测次不存在')
+    if (!isFieldEditable(section.handoffStatus)) {
+      throw new Error('测次已交回站上，测深 / 流速冻结，不能修改')
+    }
+    return section
+  }
+
+  /** 测点 / 测深变动后回刷外业流量快照（仅可编辑态生效） */
+  async function refreshFlowBySection(sectionId: string): Promise<void> {
+    const section = await db.sections.get(sectionId)
+    if (section && isFieldEditable(section.handoffStatus)) {
+      await saveFieldFlowSnapshot(sectionId)
+    }
+  }
 
   async function createVertical(
     sectionId: string,
-    payload: Omit<Vertical, 'id' | 'createdAt' | 'updatedAt' | 'sectionId'>
+    payload: Omit<Vertical, 'id' | 'side' | 'createdAt' | 'updatedAt' | 'sectionId'>
   ): Promise<Vertical> {
+    const section = await db.sections.get(sectionId)
+    if (!section) throw new Error('所属测次不存在')
+    if (!isFieldEditable(section.handoffStatus)) {
+      throw new Error('测次已交回站上，垂线布设冻结')
+    }
     const now = Date.now()
-    const row: Vertical = { ...payload, sectionId, id: createId('vrt'), createdAt: now, updatedAt: now }
+    const row: Vertical = { ...payload, sectionId, side: 'field', id: createId('vrt'), createdAt: now, updatedAt: now }
     await db.verticals.put(row)
     // 录入测深后按相对水深自动生成测点行
     const depths = buildRelativeDepths(payload.pointCount)
@@ -220,26 +307,33 @@ export const useSectionStore = defineStore('section', () => {
       velocityMs: 0.5,
       weight: Number((1 / depths.length).toFixed(4)),
       durationS: 100,
+      side: 'field',
       createdAt: now + index,
       updatedAt: now + index
     }))
     if (pointRows.length > 0) await db.points.bulkPut(pointRows)
+    await refreshFlowBySection(sectionId)
     return row
   }
 
   async function updateVertical(id: string, patch: Partial<Vertical>): Promise<void> {
-    await db.verticals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const section = await requireEditableByVertical(id)
+    await db.verticals.update(id, { ...patch, side: 'field', updatedAt: Date.now() } as never)
+    await refreshFlowBySection(section.id)
   }
 
   async function removeVertical(id: string): Promise<void> {
+    const section = await requireEditableByVertical(id)
     await db.transaction('rw', [db.verticals, db.points], async () => {
       await db.points.where('verticalId').equals(id).delete()
       await db.verticals.delete(id)
     })
+    await refreshFlowBySection(section.id)
   }
 
   /** 按测点数重排该垂线的测点行（保持已有流速值，缺失的补默认） */
   async function regeneratePoints(verticalId: string, pointCount: number): Promise<number> {
+    const section = await requireEditableByVertical(verticalId)
     const existing = pointsOfVertical(verticalId)
     const depths = buildRelativeDepths(pointCount)
     const now = Date.now()
@@ -252,6 +346,7 @@ export const useSectionStore = defineStore('section', () => {
         velocityMs: match?.velocityMs ?? 0.5,
         weight: Number((1 / depths.length).toFixed(4)),
         durationS: match?.durationS ?? 100,
+        side: 'field',
         createdAt: match?.createdAt ?? now + index,
         updatedAt: now + index
       }
@@ -261,6 +356,7 @@ export const useSectionStore = defineStore('section', () => {
       if (rows.length > 0) await db.points.bulkPut(rows)
       await db.verticals.update(verticalId, { pointCount: rows.length, updatedAt: now } as never)
     })
+    await refreshFlowBySection(section.id)
     return rows.length
   }
 
@@ -268,35 +364,49 @@ export const useSectionStore = defineStore('section', () => {
 
   async function createPoint(
     verticalId: string,
-    payload: Omit<Point, 'id' | 'createdAt' | 'updatedAt' | 'verticalId'>
+    payload: Omit<Point, 'id' | 'side' | 'createdAt' | 'updatedAt' | 'verticalId'>
   ): Promise<Point> {
+    const section = await requireEditableByVertical(verticalId)
     const now = Date.now()
-    const row: Point = { ...payload, verticalId, id: createId('pnt'), createdAt: now, updatedAt: now }
+    const row: Point = { ...payload, verticalId, side: 'field', id: createId('pnt'), createdAt: now, updatedAt: now }
     await db.points.put(row)
     await syncVerticalPointCount(verticalId)
+    await refreshFlowBySection(section.id)
     return row
   }
 
   async function updatePoint(id: string, patch: Partial<Point>): Promise<void> {
-    await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const point = points.value.find((item) => item.id === id)
+    if (point) await requireEditableByVertical(point.verticalId)
+    await db.points.update(id, { ...patch, side: 'field', updatedAt: Date.now() } as never)
+    if (point) await refreshFlowBySection((await db.verticals.get(point.verticalId))?.sectionId ?? '')
   }
 
   async function removePoint(id: string): Promise<void> {
     const point = points.value.find((item) => item.id === id)
-    await db.points.delete(id)
-    if (point) await syncVerticalPointCount(point.verticalId)
+    if (point) {
+      const section = await requireEditableByVertical(point.verticalId)
+      await db.points.delete(id)
+      await syncVerticalPointCount(point.verticalId)
+      await refreshFlowBySection(section.id)
+    } else {
+      await db.points.delete(id)
+    }
   }
 
   /** 批量改写某垂线全部测点流速（批量录入） */
   async function bulkSetVelocity(verticalId: string, velocityMs: number): Promise<number> {
+    const section = await requireEditableByVertical(verticalId)
     const now = Date.now()
     await db.points
       .where('verticalId')
       .equals(verticalId)
       .modify((point) => {
         point.velocityMs = velocityMs
+        point.side = 'field'
         point.updatedAt = now
       })
+    await refreshFlowBySection(section.id)
     return pointsOfVertical(verticalId).length
   }
 
@@ -305,6 +415,7 @@ export const useSectionStore = defineStore('section', () => {
     verticalId: string,
     rows: Array<{ relativeDepth: number; velocityMs: number; durationS: number }>
   ): Promise<number> {
+    const section = await requireEditableByVertical(verticalId)
     const now = Date.now()
     const records: Point[] = rows.map((row, index) => ({
       id: createId('pnt'),
@@ -313,6 +424,7 @@ export const useSectionStore = defineStore('section', () => {
       velocityMs: row.velocityMs,
       weight: Number((1 / rows.length).toFixed(4)),
       durationS: row.durationS,
+      side: 'field',
       createdAt: now + index,
       updatedAt: now + index
     }))
@@ -321,6 +433,7 @@ export const useSectionStore = defineStore('section', () => {
       await db.points.bulkPut(records)
       await db.verticals.update(verticalId, { pointCount: records.length, updatedAt: now } as never)
     })
+    await refreshFlowBySection(section.id)
     return records.length
   }
 
@@ -331,10 +444,12 @@ export const useSectionStore = defineStore('section', () => {
 
   /** 权重归一化：按测点数平均分配计算权重 */
   async function normalizeWeights(verticalId: string): Promise<number> {
+    const section = await requireEditableByVertical(verticalId)
     const rows = pointsOfVertical(verticalId)
     if (rows.length === 0) return 0
     const weight = Number((1 / rows.length).toFixed(4))
-    await db.points.bulkPut(rows.map((row) => ({ ...row, weight, updatedAt: Date.now() })))
+    await db.points.bulkPut(rows.map((row) => ({ ...row, weight, side: 'field' as const, updatedAt: Date.now() })))
+    await refreshFlowBySection(section.id)
     return rows.length
   }
 
@@ -360,6 +475,10 @@ export const useSectionStore = defineStore('section', () => {
     verticalStats,
     sectionVerticalCounts,
     findDistanceConflicts,
+    fieldOwnedSections,
+    pendingReviewSections,
+    acceptedSections,
+    isSectionEditable,
     patchFilter,
     resetFilter,
     selectSection,

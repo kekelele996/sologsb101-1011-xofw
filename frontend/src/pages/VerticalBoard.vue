@@ -14,6 +14,7 @@ import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
+import { HANDOFF_STATUS_LABEL, HANDOFF_STATUS_TAG_TYPE, isFieldEditable } from '@/types/handoff'
 import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
@@ -25,6 +26,9 @@ const sectionStore = useSectionStore()
 const sectionId = computed(() => String(route.params.id ?? ''))
 const section = computed(() => sectionStore.sectionById(sectionId.value))
 const station = computed(() => (section.value ? stationStore.stationById(section.value.stationId) : null))
+
+/** 外业是否仍可改测深（draft / returned 可改，已交回/已采用只读） */
+const editable = computed(() => (section.value ? isFieldEditable(section.value.handoffStatus) : false))
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -96,6 +100,10 @@ function openEdit(vertical: Vertical): void {
 }
 
 async function submitForm(): Promise<void> {
+  if (!editable.value) {
+    ElMessage.warning('测次已交回站上，外业侧只读，不能修改垂线')
+    return
+  }
   if (!Number.isFinite(form.startDistanceM) || form.startDistanceM < 0) {
     ElMessage.warning('起点距应为非负数字（m）')
     return
@@ -137,6 +145,10 @@ async function submitForm(): Promise<void> {
 }
 
 async function removeVertical(vertical: Vertical): Promise<void> {
+  if (!editable.value) {
+    ElMessage.info('测次已交回站上，外业侧只读')
+    return
+  }
   try {
     await ElMessageBox.confirm(
       `删除垂线 ${vertical.no} 将同时删除其 ${vertical.pointCount} 个流速测点，确认删除？`,
@@ -151,6 +163,10 @@ async function removeVertical(vertical: Vertical): Promise<void> {
 }
 
 async function regenerate(vertical: Vertical): Promise<void> {
+  if (!editable.value) {
+    ElMessage.info('测次交回后测点行冻结，不能重排')
+    return
+  }
   try {
     await ElMessageBox.confirm(
       `按当前测点数（${vertical.pointCount}）重新生成测点行？已录入的流速值会按相对水深尽量保留。`,
@@ -209,22 +225,53 @@ onMounted(() => {
           </el-breadcrumb>
           <h2 class="page__title">
             测次 {{ section.measureNo }} · 垂线布设与测深
-            <el-tag size="small" effect="plain">{{ section.method }}</el-tag>
+            <el-tag size="small" :type="HANDOFF_STATUS_TAG_TYPE[section.handoffStatus]" effect="plain">
+              {{ HANDOFF_STATUS_LABEL[section.handoffStatus] }}
+            </el-tag>
+            <el-tag size="small" effect="plain">现场测法 {{ section.method }}</el-tag>
+            <el-tag size="small" :type="section.determinedMethod ? 'success' : 'info'" effect="dark">
+              站上认定 {{ section.determinedMethod ?? '未认定' }}
+            </el-tag>
             <el-tag size="small" type="info" effect="plain">水位 {{ section.stageM.toFixed(2) }} m</el-tag>
           </h2>
           <p class="gb-hint">
-            录入起点距与水深，测点数决定按相对水深自动生成的测点行（1/2/3/5 点法有预设分布）。垂线按起点距升序参与流量计算。
+            <template v-if="editable">
+              录入起点距与水深，测点数决定按相对水深自动生成的测点行（1/2/3/5 点法有预设分布）。垂线按起点距升序参与流量计算，交回时固化。
+            </template>
+            <template v-else>
+              该测次已交回站上，外业侧只读：测深、流速与断面流量均为交回时固化成果，站上做测法认定与定线发布，不会改写此处数据。
+            </template>
           </p>
         </div>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
+        <el-button v-if="editable" type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
       </div>
 
       <div class="gb-stats-row">
         <StatBadge label="垂线条数" :value="stats.verticalCount" suffix="条" icon="Histogram" />
         <StatBadge label="测点合计" :value="stats.pointCount" suffix="点" tone="info" icon="DataLine" />
         <StatBadge label="最大水深" :value="stats.maxDepthM.toFixed(2)" suffix="m" tone="warning" icon="Odometer" />
-        <StatBadge label="断面流量" :value="discharge.flowM3s.toFixed(2)" suffix="m³/s" tone="success" icon="TrendCharts" />
+        <StatBadge
+          label="外业断面流量"
+          :value="(section.fieldFlowM3s > 0 ? section.fieldFlowM3s : discharge.flowM3s).toFixed(2)"
+          suffix="m³/s"
+          tone="success"
+          icon="TrendCharts"
+        />
       </div>
+
+      <el-alert
+        v-if="!editable"
+        :type="section.handoffStatus === 'returned' ? 'error' : section.handoffStatus === 'accepted' ? 'success' : 'warning'"
+        show-icon
+        :closable="false"
+        :title="
+          section.handoffStatus === 'returned'
+            ? `站上已退回（${section.returnReason || '未填写原因'}），请在原处修改后重新交回`
+            : section.handoffStatus === 'accepted'
+              ? '测次已被站上采用并发布定线；如需修改请在测次列表申请修订'
+              : '测次已交回待站上复核，外业数据冻结'
+        "
+      />
 
       <el-alert
         v-if="conflicts.length > 0"
@@ -279,10 +326,15 @@ onMounted(() => {
         <el-table-column prop="vertical.bedNote" label="河床质 / 备注" min-width="170" show-overflow-tooltip />
         <el-table-column label="操作" width="290" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" type="primary" :icon="Right" @click="gotoPoints(row.vertical)">测点</el-button>
-            <el-button size="small" :icon="Edit" @click="openEdit(row.vertical)">编辑</el-button>
-            <el-button size="small" :icon="Refresh" @click="regenerate(row.vertical)">重排</el-button>
-            <el-button size="small" type="danger" plain :icon="Delete" @click="removeVertical(row.vertical)">删除</el-button>
+            <el-button size="small" type="primary" :icon="Right" @click="gotoPoints(row.vertical)">
+              {{ editable ? '测点' : '查看测点' }}
+            </el-button>
+            <template v-if="editable">
+              <el-button size="small" :icon="Edit" @click="openEdit(row.vertical)">编辑</el-button>
+              <el-button size="small" :icon="Refresh" @click="regenerate(row.vertical)">重排</el-button>
+              <el-button size="small" type="danger" plain :icon="Delete" @click="removeVertical(row.vertical)">删除</el-button>
+            </template>
+            <el-tag v-else size="small" type="info" effect="plain">外业只读</el-tag>
           </template>
         </el-table-column>
       </el-table>

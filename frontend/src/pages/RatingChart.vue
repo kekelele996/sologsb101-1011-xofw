@@ -1,12 +1,14 @@
 <script setup lang="ts">
 /**
- * 模块 5：/ratings 水位流量关系点据与定线
- * 幂函数拟合 Q = a×(H-H0)^b、残差展示、超限点据挂红，并同步 URL query。
+ * 站上工作台：/ratings 水位流量关系定线发布与版本
+ * - 曲线参数以「当前发布版本」为准，外业改测点不会即时改变定线；
+ * - 只有交回复核通过才发布新一版（复核动作在 /review）；历史版本冻结可查；
+ * - 手工新增/编辑仅限无来源测次的历史遗留点据。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
+import { CircleCheck, Delete, Document, Edit, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
@@ -14,7 +16,10 @@ import DeviationTag from '@/components/common/DeviationTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
-import { fitPowerCurve, type Rating, type RatingFitResult } from '@/types/rating'
+import type { Rating } from '@/types/rating'
+import type { RatingVersion } from '@/types/ratingVersion'
+import { RATING_VERSION_STATUS_LABEL } from '@/types/ratingVersion'
+import { curveFlow } from '@/types/rating'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -34,30 +39,66 @@ const form = reactive({
   measuredAt: new Date().toISOString().slice(0, 16)
 })
 
+/** 历史版本抽屉 */
+const historyVisible = ref(false)
+/** 版本历史折叠面板展开项 */
+const activeHistory = ref<string[]>([])
+
 const fit = computed(() => ratingStore.activeFit)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
+const currentVersion = computed<RatingVersion | null>(() => ratingStore.currentVersionOf(ratingStore.activeLineNo))
+const lineVersions = computed<RatingVersion[]>(() => ratingStore.versionsOfLine(ratingStore.activeLineNo))
 
-/** 当前定线号下的点据（含曲线流量与残差） */
-const pointRows = computed(() =>
-  ratingStore.ratings
-    .filter((rating) => rating.lineNo === ratingStore.activeLineNo)
-    .sort((a, b) => a.stageM - b.stageM)
-    .map((rating) => {
-      const predicted = fit.value.valid ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
-      const residualPct =
-        fit.value.valid && rating.flowM3s > 0
-          ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
-          : 0
-      const compare = ratingStore.compares.find((item) => item.ratingId === rating.id)
-      return {
-        rating,
-        stationName: ratingStore.stationNameOf(rating.stationId),
-        predicted,
-        residualPct,
-        verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
-      }
-    })
-)
+/** 当前版本快照点据（冻结），未发布过则回落到当前点据表 */
+const pointRows = computed(() => {
+  const version = currentVersion.value
+  const fitValue = fit.value
+  if (version) {
+    return version.points
+      .map((point) => {
+        const rating = ratingStore.ratings.find((item) => item.id === point.ratingId) ?? null
+        const predicted = fitValue.valid ? curveFlow(fitValue, point.stageM) : 0
+        const residualPct =
+          fitValue.valid && point.flowM3s > 0
+            ? Number((((point.flowM3s - predicted) / point.flowM3s) * 100).toFixed(2))
+            : 0
+        const compare = ratingStore.compares.find(
+          (item) => item.ratingId === point.ratingId && item.versionId === version.id
+        )
+        return {
+          ratingId: point.ratingId,
+          sectionId: point.sectionId,
+          stationId: point.stationId,
+          stageM: point.stageM,
+          flowM3s: point.flowM3s,
+          measureNo: point.measureNo,
+          measuredAt: point.measuredAt,
+          determinedMethod: point.determinedMethod,
+          stationName: ratingStore.stationNameOf(point.stationId),
+          predicted,
+          residualPct,
+          verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
+        }
+      })
+      .sort((a, b) => a.stageM - b.stageM)
+  }
+  return ratingStore.pointRows.map((row) => ({
+    ratingId: row.rating.id,
+    sectionId: row.rating.sectionId,
+    stationId: row.rating.stationId,
+    stageM: row.rating.stageM,
+    flowM3s: row.rating.flowM3s,
+    measureNo: row.rating.measureNo,
+    measuredAt: row.rating.measuredAt,
+    determinedMethod: row.rating.determinedMethod,
+    stationName: row.stationName,
+    predicted: row.predicted,
+    residualPct: row.residualPct,
+    verdict:
+      ratingStore.compares.find((item) => item.ratingId === row.rating.id)?.verdict ??
+      (Math.abs(row.residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
+  }))
+})
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: ratingStore.filter.keyword,
@@ -66,14 +107,14 @@ const filterModel = computed<FilterModel>(() => ({
   verdicts: ratingStore.filter.verdicts
 }))
 
-/** 关系曲线坐标：横轴水位、纵轴流量 */
+/** 关系曲线坐标：横轴水位、纵轴流量（按当前发布版参数） */
 const chart = computed(() => {
   const rows = pointRows.value
   if (rows.length === 0) {
     return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string }>, stageMin: 0, stageMax: 0, flowMax: 0 }
   }
-  const stages = rows.map((row) => row.rating.stageM)
-  const flows = rows.map((row) => row.rating.flowM3s)
+  const stages = rows.map((row) => row.stageM)
+  const flows = rows.map((row) => row.flowM3s)
   const stageMin = Math.min(...stages)
   const stageMax = Math.max(...stages)
   const flowMax = Math.max(...flows) * 1.1
@@ -93,9 +134,9 @@ const chart = computed(() => {
   return {
     samples,
     points: rows.map((row) => ({
-      id: row.rating.id,
-      cx: toX(row.rating.stageM),
-      cy: toY(row.rating.flowM3s),
+      id: row.ratingId,
+      cx: toX(row.stageM),
+      cy: toY(row.flowM3s),
       verdict: row.verdict
     })),
     stageMin,
@@ -108,15 +149,18 @@ function openCreate(): void {
   editingId.value = null
   form.stationId = stationStore.currentStationId ?? stationStore.stations[0]?.id ?? ''
   form.lineNo = ratingStore.activeLineNo
-  const last = pointRows.value[pointRows.value.length - 1]
-  form.stageM = last ? Number((last.rating.stageM + 0.2).toFixed(2)) : 3
-  form.flowM3s = last ? Number((last.rating.flowM3s * 1.2).toFixed(1)) : 50
-  form.measureNo = `${new Date().getFullYear()}-${String(ratingStore.ratings.length + 1).padStart(3, '0')}`
+  form.stageM = 3
+  form.flowM3s = 50
+  form.measureNo = ''
   form.measuredAt = new Date().toISOString().slice(0, 16)
   dialogVisible.value = true
 }
 
 function openEdit(rating: Rating): void {
+  if (rating.sectionId !== null) {
+    ElMessage.info('该点据来自外业交回测次，流量以测次成果为准，不能在此编辑')
+    return
+  }
   editingId.value = rating.id
   form.stationId = rating.stationId
   form.stageM = rating.stageM
@@ -152,53 +196,44 @@ async function submitForm(): Promise<void> {
     }
     if (editingId.value) {
       await ratingStore.updateRating(editingId.value, payload)
-      ElMessage.success('点据已更新')
+      ElMessage.success('历史遗留点据已更新；需在复核台重新发布才会改变定线')
     } else {
       await ratingStore.createRating(payload)
-      ElMessage.success('点据已新增，正在重算定线')
+      ElMessage.success('历史遗留点据已新增；交回复核发布后才会进入定线')
     }
     ratingStore.setActiveLine(payload.lineNo)
     dialogVisible.value = false
-    await ratingStore.rebuildCompares(payload.lineNo)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   } finally {
     submitting.value = false
   }
 }
 
 async function removeRating(rating: Rating): Promise<void> {
+  if (rating.sectionId !== null) {
+    ElMessage.info('该点据来自已采用测次，不能直接删除；请由外业修订测次后重新交回')
+    return
+  }
   try {
     await ElMessageBox.confirm(
-      `删除水位 ${rating.stageM.toFixed(2)} m 处的点据将同时删除其比测记录，确认删除？`,
+      `删除水位 ${rating.stageM.toFixed(2)} m 处的历史遗留点据？已发布版本中的快照保留可查。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
     )
   } catch {
     return
   }
-  await ratingStore.removeRating(rating.id)
-  await ratingStore.rebuildCompares(rating.lineNo)
-  ElMessage.success('点据已删除并重算定线')
-}
-
-async function refit(): Promise<void> {
-  const result: RatingFitResult = fitPowerCurve(
-    pointRows.value.map((row) => ({ stageM: row.rating.stageM, flowM3s: row.rating.flowM3s })),
-    ratingStore.activeLineNo
-  )
-  ratingStore.setFit(result)
-  const count = await ratingStore.rebuildCompares(ratingStore.activeLineNo)
-  if (result.valid) {
-    ElMessage.success(
-      `定线完成：Q = ${result.a}×(H-${result.h0})^${result.b}，平均残差 ${result.meanResidualPct}%，刷新比测 ${count} 条`
-    )
-  } else {
-    ElMessage.warning(result.message || '当前点据不足以定线')
+  try {
+    await ratingStore.removeRating(rating.id)
+    ElMessage.success('历史遗留点据已删除')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
   }
 }
 
 function handleLineChange(lineNo: string | number | boolean | undefined): void {
   ratingStore.setActiveLine(String(lineNo))
-  void ratingStore.rebuildCompares(String(lineNo))
 }
 
 function handleFilterChange(): void {
@@ -217,6 +252,10 @@ function handleReset(): void {
   void router.replace({ query: {} })
 }
 
+function gotoReview(): void {
+  void router.push('/review')
+}
+
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
   const query = route.query
@@ -229,7 +268,6 @@ onMounted(() => {
         ? (query.verdict.split(',').filter((item) => item === '合格' || item === '超限') as Array<'合格' | '超限'>)
         : []
   })
-  void ratingStore.rebuildCompares(ratingStore.activeLineNo)
 })
 </script>
 
@@ -239,21 +277,18 @@ onMounted(() => {
 
     <div class="page__head">
       <div>
-        <h2 class="page__title">水位流量关系点据与定线</h2>
+        <h2 class="page__title">水位流量关系定线发布与版本（站上整编）</h2>
         <p class="gb-hint">
-          点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b，残差超过 {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单。
+          报出去的定线以当前发布版本为准；外业测点修改不会即时改变定线，须经交回复核通过发布新版。历史版本冻结、可随时查询。
         </p>
       </div>
       <div class="page__actions">
-        <el-select
-          :model-value="ratingStore.activeLineNo"
-          class="page__line-select"
-          @change="handleLineChange"
-        >
+        <el-select :model-value="ratingStore.activeLineNo" class="page__line-select" @change="handleLineChange">
           <el-option v-for="lineNo in lineNos" :key="lineNo" :label="`${lineNo} 线`" :value="lineNo" />
         </el-select>
-        <el-button :icon="Refresh" @click="refit">重新定线</el-button>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增点据</el-button>
+        <el-button :icon="Document" @click="historyVisible = true">版本历史（{{ lineVersions.length }}）</el-button>
+        <el-button type="primary" :icon="CircleCheck" @click="gotoReview">去复核台发布</el-button>
+        <el-button :icon="Plus" @click="openCreate">补历史遗留点</el-button>
       </div>
     </div>
 
@@ -266,22 +301,35 @@ onMounted(() => {
           options: stationStore.stations.map((station) => ({ label: station.name, value: station.id }))
         },
         { key: 'lineNos', label: '定线号', options: lineNos.map((lineNo) => ({ label: `${lineNo} 线`, value: lineNo })) },
-        {
-          key: 'verdicts',
-          label: '判定',
-          options: [
-            { label: '合格', value: '合格' },
-            { label: '超限', value: '超限' }
-          ]
-        }
+        { key: 'verdicts', label: '判定', options: [
+          { label: '合格', value: '合格' },
+          { label: '超限', value: '超限' }
+        ] }
       ]"
       keyword-placeholder="搜索测次号 / 定线号 / 测站"
       @change="handleFilterChange"
       @reset="handleReset"
     />
 
+    <el-alert
+      v-if="currentVersion"
+      type="success"
+      show-icon
+      :closable="false"
+      :title="`${currentVersion.lineNo} 线当前生效第 ${currentVersion.versionNo} 版（${new Date(currentVersion.publishedAt).toLocaleString('zh-CN')} 由 ${currentVersion.publishedBy} 发布）`"
+      :description="`Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%。本版冻结，复核发布新版前不会因测点改动而变化。`"
+    />
+    <el-alert
+      v-else
+      type="warning"
+      show-icon
+      :closable="false"
+      title="该定线号尚未发布任何版本"
+      description="当前曲线仅为按点据的临时拟合候选，不作数；请在复核台对交回测次复核通过后发布首版。"
+    />
+
     <div class="gb-stats-row">
-      <StatBadge label="current 线点据" :value="pointRows.length" suffix="点" icon="DataLine" />
+      <StatBadge label="当前版点据" :value="pointRows.length" suffix="点" icon="TrendCharts" />
       <StatBadge
         label="定线系数 a"
         :value="fit.valid ? fit.a : '—'"
@@ -294,50 +342,35 @@ onMounted(() => {
         :value="fit.valid ? fit.meanResidualPct : '—'"
         suffix="%"
         :tone="fit.valid && fit.meanResidualPct <= ratingStore.deviationLimitPct ? 'success' : 'warning'"
-        icon="Histogram"
+        icon="Refresh"
       />
       <StatBadge
         label="超限点据"
         :value="pointRows.filter((row) => row.verdict === '超限').length"
         suffix="点"
         :tone="pointRows.some((row) => row.verdict === '超限') ? 'danger' : 'success'"
-        :icon="pointRows.some((row) => row.verdict === '超限') ? 'WarningFilled' : 'DataLine'"
+        :icon="pointRows.some((row) => row.verdict === '超限') ? 'WarningFilled' : 'TrendCharts'"
       />
     </div>
-
-    <el-alert
-      v-if="!fit.valid"
-      type="warning"
-      show-icon
-      :closable="false"
-      :title="fit.message || '当前定线号下点据不足，至少需要 3 个实测点才能定线'"
-    />
-    <el-alert
-      v-else
-      type="success"
-      show-icon
-      :closable="false"
-      :title="`${fit.lineNo} 线定线有效：Q = ${fit.a} × (H - ${fit.h0})^${fit.b}；样本 ${fit.sampleCount} 点，平均残差 ${fit.meanResidualPct}%，最大残差 ${fit.maxResidualPct}%`"
-    />
 
     <div class="page__grid">
       <EmptyPanel
         v-if="pointRows.length === 0"
-        title="该定线号下还没有关系点据"
-        description="录入实测水位与流量点据后即可做幂函数定线；也可以先切换到其他定线号查看已有成果。"
-        action-text="新增点据"
+        title="该定线号下还没有已发布点据"
+        description="外业交回测次、站上复核通过后点据才会随版发布；历史遗留点可手工补录。"
+        action-text="补历史遗留点"
         @action="openCreate"
       />
 
       <el-table v-else :data="pointRows" border stripe class="gb-table-compact">
-        <el-table-column label="水位 (m)" width="110" align="right">
+        <el-table-column label="水位 (m)" width="100" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.rating.stageM.toFixed(2) }}</span>
+            <span class="gb-mono">{{ row.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量 (m³/s)" width="150" align="right">
+        <el-table-column label="外业实测流量 (m³/s)" width="165" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.rating.flowM3s.toFixed(1) }}</span>
+            <span class="gb-mono">{{ row.flowM3s.toFixed(1) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="曲线流量 (m³/s)" width="150" align="right">
@@ -345,33 +378,51 @@ onMounted(() => {
             <span class="gb-mono">{{ row.predicted > 0 ? row.predicted.toFixed(1) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="残差" width="200">
+        <el-table-column label="残差" width="190">
           <template #default="{ row }">
             <DeviationTag :deviation-pct="row.residualPct" :verdict="row.verdict" :limit="ratingStore.deviationLimitPct" />
           </template>
         </el-table-column>
-        <el-table-column label="测站 / 测次" min-width="180">
+        <el-table-column label="来源 / 认定测法" min-width="200">
           <template #default="{ row }">
-            <div>{{ row.stationName }}</div>
-            <div class="gb-hint gb-mono">{{ row.rating.measureNo || '未标记测次' }}</div>
+            <div>
+              {{ row.stationName }}
+              <el-tag size="small" :type="row.sectionId ? 'success' : 'info'" effect="plain" class="page__source-tag">
+                {{ row.sectionId ? '测次交回' : '历史遗留' }}
+              </el-tag>
+            </div>
+            <div class="gb-hint gb-mono">{{ row.measureNo || '未标记测次' }} · 认定 {{ row.determinedMethod ?? '—' }}</div>
           </template>
         </el-table-column>
-        <el-table-column label="点据时间" width="170">
+        <el-table-column label="点据时间" width="160">
           <template #default="{ row }">
-            <span class="gb-mono">{{ new Date(row.rating.measuredAt).toLocaleDateString('zh-CN') }}</span>
+            <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleDateString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="130" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" :icon="Edit" @click="openEdit(row.rating)">编辑</el-button>
-            <el-button size="small" type="danger" plain :icon="Delete" @click="removeRating(row.rating)">删除</el-button>
+            <template v-if="!row.sectionId">
+              <el-button
+                size="small"
+                :icon="Edit"
+                @click="openEdit(ratingStore.ratings.find((item) => item.id === row.ratingId) as Rating)"
+              >编辑</el-button>
+              <el-button
+                size="small"
+                type="danger"
+                plain
+                :icon="Delete"
+                @click="removeRating(ratingStore.ratings.find((item) => item.id === row.ratingId) as Rating)"
+              >删除</el-button>
+            </template>
+            <el-tag v-else size="small" type="success" effect="plain">交回点据</el-tag>
           </template>
         </el-table-column>
       </el-table>
 
       <el-card shadow="never" class="page__chart-card">
         <div class="gb-panel-title">
-          <h3>{{ ratingStore.activeLineNo }} 线关系曲线</h3>
+          <h3>{{ ratingStore.activeLineNo }} 线关系曲线{{ currentVersion ? ` · v${currentVersion.versionNo}` : '（未发布）' }}</h3>
           <el-icon><TrendCharts /></el-icon>
         </div>
         <svg v-if="pointRows.length > 0" viewBox="0 0 360 220" class="page__chart">
@@ -392,12 +443,18 @@ onMounted(() => {
             :stroke="point.verdict === '超限' ? '#7b241c' : '#0f4c75'"
           />
         </svg>
-        <EmptyPanel v-else title="暂无可绘制的点据" description="录入点据后自动生成关系曲线。" compact />
-        <p class="gb-hint">红点表示残差超限的点据，曲线为幂函数定线成果。</p>
+        <EmptyPanel v-else title="暂无可绘制的点据" description="复核发布定线后自动生成关系曲线。" compact />
+        <p class="gb-hint">红点为残差超限点据；曲线为当前发布版幂函数定线成果，历史版本可在「版本历史」中查看。</p>
       </el-card>
     </div>
 
-    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑关系点据' : '新增关系点据'" width="560px" :close-on-click-modal="false">
+    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑历史遗留点据' : '补录历史遗留点据'" width="560px" :close-on-click-modal="false">
+      <el-alert
+        type="info"
+        :closable="false"
+        title="仅用于站上手工整编、无对应外业测次的早期点据；来自测次的点据必须由外业交回复核产生。"
+        class="page__dialog-alert"
+      />
       <el-form label-width="110px">
         <el-form-item label="所属测站" required>
           <el-select v-model="form.stationId" placeholder="选择测站" class="page__full">
@@ -416,7 +473,7 @@ onMounted(() => {
           <span class="page__unit">m³/s</span>
         </el-form-item>
         <el-form-item label="测次号">
-          <el-input v-model="form.measureNo" placeholder="如：2024-06-001" maxlength="32" />
+          <el-input v-model="form.measureNo" placeholder="历史资料可留空" maxlength="32" />
         </el-form-item>
         <el-form-item label="点据时间">
           <el-date-picker v-model="form.measuredAt" type="datetime" value-format="YYYY-MM-DDTHH:mm" placeholder="选择时间" />
@@ -424,11 +481,56 @@ onMounted(() => {
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="submitForm">
-          {{ editingId ? '保存并重算' : '新增并定线' }}
-        </el-button>
+        <el-button type="primary" :loading="submitting" @click="submitForm">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 版本历史抽屉：已发布各版均可查 -->
+    <el-drawer v-model="historyVisible" :title="`${ratingStore.activeLineNo} 线定线版本历史`" size="520px">
+      <div class="page__history">
+        <EmptyPanel v-if="lineVersions.length === 0" title="尚未发布过版本" description="复核台通过交回测次后发布首版。" compact />
+        <el-collapse v-else v-model="activeHistory">
+          <el-collapse-item
+            v-for="version in lineVersions"
+            :key="version.id"
+            :name="version.id"
+            :title="`第 ${version.versionNo} 版 · ${RATING_VERSION_STATUS_LABEL[version.status]}`"
+          >
+            <div class="page__version-head">
+              <el-tag size="small" :type="version.status === 'current' ? 'success' : 'info'" effect="plain">
+                {{ RATING_VERSION_STATUS_LABEL[version.status] }}
+              </el-tag>
+              <span class="gb-hint">{{ new Date(version.publishedAt).toLocaleString('zh-CN') }} · {{ version.publishedBy }}</span>
+            </div>
+            <el-descriptions :column="2" border size="small" class="page__version-desc">
+              <el-descriptions-item label="系数 a">{{ version.fit.a }}</el-descriptions-item>
+              <el-descriptions-item label="指数 b">{{ version.fit.b }}</el-descriptions-item>
+              <el-descriptions-item label="基线 H0">{{ version.fit.h0 }}</el-descriptions-item>
+              <el-descriptions-item label="样本点数">{{ version.fit.sampleCount }}</el-descriptions-item>
+              <el-descriptions-item label="平均残差">{{ version.fit.meanResidualPct }}%</el-descriptions-item>
+              <el-descriptions-item label="最大残差">{{ version.fit.maxResidualPct }}%</el-descriptions-item>
+              <el-descriptions-item label="R²">{{ version.fit.r2 }}</el-descriptions-item>
+              <el-descriptions-item label="触发测次">{{ version.sourceSectionIds.length }} 个</el-descriptions-item>
+            </el-descriptions>
+            <p class="gb-hint">{{ version.reviewNote }}</p>
+            <el-table :data="version.points" size="small" border max-height="260">
+              <el-table-column label="水位 (m)" prop="stageM" width="100" align="right">
+                <template #default="{ row }">{{ row.stageM.toFixed(2) }}</template>
+              </el-table-column>
+              <el-table-column label="流量 (m³/s)" prop="flowM3s" align="right">
+                <template #default="{ row }">{{ row.flowM3s.toFixed(1) }}</template>
+              </el-table-column>
+              <el-table-column label="测次 / 认定" min-width="150">
+                <template #default="{ row }">
+                  <div class="gb-hint gb-mono">{{ row.measureNo || '历史遗留' }}</div>
+                  <div class="gb-hint">{{ row.determinedMethod ?? '—' }}</div>
+                </template>
+              </el-table-column>
+            </el-table>
+          </el-collapse-item>
+        </el-collapse>
+      </div>
+    </el-drawer>
   </section>
 </template>
 
@@ -460,7 +562,7 @@ onMounted(() => {
 }
 
 .page__line-select {
-  width: 120px;
+  width: 110px;
 }
 
 .page__grid {
@@ -487,6 +589,32 @@ onMounted(() => {
 
 .page__full {
   width: 100%;
+}
+
+.page__source-tag {
+  margin-left: 6px;
+}
+
+.page__dialog-alert {
+  margin-bottom: 12px;
+}
+
+.page__history {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.page__version-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.page__version-desc {
+  margin-bottom: 8px;
 }
 
 @media (max-width: 1180px) {

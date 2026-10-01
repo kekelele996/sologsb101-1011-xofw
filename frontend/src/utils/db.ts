@@ -1,23 +1,25 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 库名 gbhydrogaug，含数据结构版本号与升级迁移逻辑
- * - 升级时按 version().stores() 补齐索引
+ * - 外业测验（field：测深 / 流速 / 流量）与站上整编（station：测法认定 / 定线发布）两侧分写
+ * - 定线版本 ratingVersions：复核通过才发布，逐版冻结不可变，历史版本可查
  * - 首次打开自动播种互相引用的演示数据（测站 → 断面 → 垂线 → 测点 → 点据 → 比测）
  * - 纯前端应用：不依赖任何后端服务或数据库服务
  */
 import Dexie, { liveQuery, type Table } from 'dexie'
 import type { Station } from '@/types/station'
-import type { Section } from '@/types/section'
+import type { Section, MeasureMethod } from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
-import { calcDeviationPct, judgeDeviation } from '@/types/compare'
-import { fitPowerCurve } from '@/types/rating'
-import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import type { RatingVersion } from '@/types/ratingVersion'
+import { DEVIATION_LIMIT_PCT } from '@/types/compare'
+import { calcMeanVelocity, calcSectionDischarge, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { assemblePublishedVersion } from '@/utils/ratingPublish'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +42,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  ratingVersions: RatingVersion[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +52,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  ratingVersions!: Table<RatingVersion, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,35 +68,190 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
+    this.version(2).stores({
+      stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+      sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+      verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+      points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+      ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+      compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+    })
+
+    // v3：外业 / 站上两侧分开，测次交回状态机 + 定线版本发布
     this.version(DB_VERSION)
       .stores({
-        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
-        sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
-        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
-        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
-        ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
-        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+        stations: 'id, name, river, sectionCode, catchmentKm2, side, updatedAt',
+        sections:
+          'id, stationId, measureNo, method, stageM, measuredAt, side, handoffStatus, targetLineNo, acceptedLineNo, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, side, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, side, updatedAt',
+        ratings: 'id, stationId, lineNo, stageM, flowM3s, sectionId, side, publishedVersionId, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, versionId, lineNo, side, comparedAt, updatedAt',
+        ratingVersions: 'id, lineNo, versionNo, status, stationId, side, publishedAt'
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与判定结论，避免列表排序与筛选拿到 undefined
+        const now = Date.now()
+        const iso = new Date(now).toISOString()
+
+        // ① 时间戳与既有默认字段（沿用 v2 的回填规则）
         const stamps: Array<[string, () => Record<string, unknown>]> = [
           ['stations', () => ({})],
-          ['sections', () => ({ measuredAt: new Date().toISOString() })],
+          ['sections', () => ({ measuredAt: iso })],
           ['verticals', () => ({ pointCount: 0, bedNote: '' })],
           ['points', () => ({ weight: DEFAULT_WEIGHTS[1], durationS: 100 })],
           ['ratings', () => ({ measureNo: '', lineNo: 'A' })],
-          ['compares', () => ({ operator: '', comparedAt: new Date().toISOString() })]
+          ['compares', () => ({ operator: '', comparedAt: iso })]
         ]
         for (const [tableName, defaults] of stamps) {
           await tx
             .table(tableName)
             .toCollection()
             .modify((row: Record<string, unknown>) => {
-              const now = Date.now()
               if (typeof row.createdAt !== 'number') row.createdAt = now
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
               Object.assign(row, defaults())
             })
+        }
+
+        // ② 按两侧补侧别（side）与归属字段
+        await tx.table('stations').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.side !== 'field' && row.side !== 'station') row.side = 'station'
+        })
+        await tx.table('verticals').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.side !== 'field' && row.side !== 'station') row.side = 'field'
+        })
+        await tx.table('points').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.side !== 'field' && row.side !== 'station') row.side = 'field'
+        })
+        await tx.table('ratings').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.side !== 'field' && row.side !== 'station') row.side = 'station'
+          if (row.sectionId === undefined) row.sectionId = null
+          if (row.determinedMethod === undefined) row.determinedMethod = null
+          if (row.publishedVersionId === undefined) row.publishedVersionId = null
+        })
+        await tx.table('compares').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.side !== 'field' && row.side !== 'station') row.side = 'station'
+          if (row.versionId === undefined) row.versionId = null
+          if (typeof row.lineNo !== 'string') row.lineNo = 'A'
+        })
+
+        // ③ 测次升级为交回状态机：旧库里的测次视为「已交回并采用」，
+        //    外业流量快照按当时垂线/测点重算（流量按外业算），测法默认尚未由站上认定。
+        const oldSections: Section[] = await tx.table('sections').toCollection().toArray()
+        const oldVerticals: Vertical[] = await tx.table('verticals').toCollection().toArray()
+        const oldPoints: Point[] = await tx.table('points').toCollection().toArray()
+        const oldRatings: Rating[] = await tx.table('ratings').toCollection().toArray()
+
+        const pointsByVertical = new Map<string, Point[]>()
+        oldPoints.forEach((point) => {
+          const list = pointsByVertical.get(point.verticalId) ?? []
+          list.push(point)
+          pointsByVertical.set(point.verticalId, list)
+        })
+        const flowBySection = new Map<string, { flowM3s: number; areaM2: number; meanVelocityMs: number }>()
+        oldSections.forEach((section) => {
+          const verticals = oldVerticals
+            .filter((vertical) => vertical.sectionId === section.id)
+            .sort((a, b) => a.startDistanceM - b.startDistanceM)
+          const result = calcSectionDischarge(
+            verticals.map((vertical) => ({
+              id: vertical.id,
+              no: vertical.no,
+              startDistanceM: vertical.startDistanceM,
+              depthM: vertical.depthM,
+              meanVelocityMs: calcMeanVelocity(
+                (pointsByVertical.get(vertical.id) ?? []).map((point) => ({
+                  velocityMs: point.velocityMs,
+                  weight: point.weight
+                }))
+              )
+            }))
+          )
+          flowBySection.set(section.id, {
+            flowM3s: result.flowM3s,
+            areaM2: result.areaM2,
+            meanVelocityMs: result.meanVelocityMs
+          })
+        })
+
+        await tx.table('sections').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.side !== 'field' && row.side !== 'station') row.side = 'field'
+          if (!['draft', 'submitted', 'returned', 'accepted'].includes(String(row.handoffStatus))) {
+            row.handoffStatus = 'accepted'
+          }
+          const flow = flowBySection.get(String(row.id))
+          row.fieldFlowM3s = typeof row.fieldFlowM3s === 'number' ? row.fieldFlowM3s : flow?.flowM3s ?? 0
+          row.fieldAreaM2 = typeof row.fieldAreaM2 === 'number' ? row.fieldAreaM2 : flow?.areaM2 ?? 0
+          row.fieldMeanVelocityMs =
+            typeof row.fieldMeanVelocityMs === 'number' ? row.fieldMeanVelocityMs : flow?.meanVelocityMs ?? 0
+          if (typeof row.targetLineNo !== 'string') {
+            const matched = oldRatings.find((rating) => rating.measureNo === row.measureNo && rating.stationId === row.stationId)
+            row.targetLineNo = matched?.lineNo ?? 'A'
+          }
+          if (typeof row.handedAt !== 'string') row.handedAt = iso
+          if (typeof row.handoffNote !== 'string') row.handoffNote = ''
+          if (typeof row.returnedAt !== 'string') row.returnedAt = null
+          if (typeof row.returnReason !== 'string') row.returnReason = ''
+          if (typeof row.returnCount !== 'number') row.returnCount = 0
+          if (typeof row.determinedMethod !== 'string') row.determinedMethod = null
+          if (typeof row.determinedAt !== 'string') row.determinedAt = null
+          if (typeof row.determinedBy !== 'string') row.determinedBy = ''
+          if (typeof row.determinationNote !== 'string') row.determinationNote = ''
+          if (typeof row.acceptedLineNo !== 'string') row.acceptedLineNo = row.targetLineNo
+          if (typeof row.acceptedVersionId !== 'string') row.acceptedVersionId = null
+          if (typeof row.acceptedAt !== 'string') row.acceptedAt = iso
+        })
+
+        // ④ 既有定线：每条定线号用全部点据补发首版 v1（冻结参数/点据/比测），已发布那版可查
+        const upgradedSections = await tx.table<Section, string>('sections').toArray()
+        const lineGroups = new Map<string, Rating[]>()
+        oldRatings.forEach((rating) => {
+          const list = lineGroups.get(rating.lineNo) ?? []
+          list.push(rating)
+          lineGroups.set(rating.lineNo, list)
+        })
+        const versions: RatingVersion[] = []
+        const versionCompares: Compare[] = []
+        for (const [lineNo, lineRatings] of lineGroups) {
+          const versionId = `ver_${lineNo.toLowerCase()}_1`
+          const assembled = assemblePublishedVersion({
+            id: versionId,
+            lineNo,
+            versionNo: 1,
+            ratings: lineRatings,
+            sourceSectionIds: upgradedSections
+              .filter((section) => section.acceptedLineNo === lineNo)
+              .map((section) => section.id),
+            publishedBy: '升级迁移',
+            reviewNote: '由历史点据补发的首版定线',
+            deviationLimitPct: DEVIATION_LIMIT_PCT,
+            publishedAt: iso,
+            now
+          })
+          versions.push(assembled.version)
+          assembled.compares.forEach((compare) => compare.versionId = versionId)
+          versionCompares.push(...assembled.compares)
+
+          await tx
+            .table('ratings')
+            .where('lineNo')
+            .equals(lineNo)
+            .modify((row: Record<string, unknown>) => {
+              row.publishedVersionId = versionId
+            })
+          await tx
+            .table('sections')
+            .where('acceptedLineNo')
+            .equals(lineNo)
+            .modify((row: Record<string, unknown>) => {
+              row.acceptedVersionId = versionId
+            })
+        }
+        if (versions.length > 0) {
+          await tx.table('ratingVersions').clear()
+          await tx.table('ratingVersions').bulkPut(versions)
+          await tx.table('compares').clear()
+          await tx.table('compares').bulkPut(versionCompares)
         }
       })
   }
@@ -122,16 +281,46 @@ export function watchTable<T>(table: () => Table<T, string>): { subscribe: (cb: 
 
 /* ------------------------------ 演示数据播种 ------------------------------ */
 
+interface SeedPointSpec {
+  id: string
+  relativeDepth: number
+  velocityMs: number
+  durationS?: number
+}
+interface SeedVerticalSpec {
+  id: string
+  no: number
+  startDistanceM: number
+  depthM: number
+  bedNote: string
+  points: SeedPointSpec[]
+}
+interface SeedSectionSpec {
+  id: string
+  measureNo: string
+  startDistanceM: number
+  stageM: number
+  method: MeasureMethod
+  measuredAt: string
+  targetLineNo: string
+  handoffStatus: Section['handoffStatus']
+  /** 退回原因（returned 演示测次用） */
+  returnReason?: string
+  handoffNote?: string
+  verticals: SeedVerticalSpec[]
+}
 interface SeedStationBundle {
-  station: Omit<Station, 'createdAt' | 'updatedAt'>
-  sections: Array<Omit<Section, 'createdAt' | 'updatedAt'>>
-  verticals: Array<Omit<Vertical, 'createdAt' | 'updatedAt'>>
-  points: Array<Omit<Point, 'createdAt' | 'updatedAt'>>
+  station: Omit<Station, 'side' | 'createdAt' | 'updatedAt'>
+  sections: SeedSectionSpec[]
+}
+
+function pointWeight(count: number): number {
+  return Number((1 / count).toFixed(4))
 }
 
 /**
- * 播种演示数据：3 个测站 → 4 个断面测次 → 8 条垂线 → 16 个流速测点，
- * 并据此生成水位流量关系点据与比测记录，保证父 → 子 → 孙三层链路可点开。
+ * 播种演示数据：3 个测站 → 6 个断面测次（覆盖交回四态）→ 垂线 → 测点，
+ * 已采用测次的外业流量成果由站上接收为关系点据并发布 A/B/C 三线 v1（C 线含超限点）。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now()
@@ -150,40 +339,137 @@ export async function seedDemoData(): Promise<void> {
       sections: [
         {
           id: 'sec_lh_2406',
-          stationId: 'stn_lh01',
           measureNo: '2024-06-001',
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
-          measuredAt: '2024-06-12T08:30:00.000Z'
+          measuredAt: '2024-06-12T08:30:00.000Z',
+          targetLineNo: 'A',
+          handoffStatus: 'accepted',
+          handoffNote: '三点法，主流稳定，流量成果随测次交回',
+          verticals: [
+            {
+              id: 'vrt_lh_1',
+              no: 1,
+              startDistanceM: 6.5,
+              depthM: 1.4,
+              bedNote: '左岸浅滩，砾石河床',
+              points: [
+                { id: 'pnt_lh_11', relativeDepth: 0.2, velocityMs: 0.62 },
+                { id: 'pnt_lh_12', relativeDepth: 0.8, velocityMs: 0.48 }
+              ]
+            },
+            {
+              id: 'vrt_lh_2',
+              no: 2,
+              startDistanceM: 14.0,
+              depthM: 3.2,
+              bedNote: '主流，砂卵石',
+              points: [
+                { id: 'pnt_lh_21', relativeDepth: 0.2, velocityMs: 1.42 },
+                { id: 'pnt_lh_22', relativeDepth: 0.6, velocityMs: 1.18 },
+                { id: 'pnt_lh_23', relativeDepth: 0.8, velocityMs: 0.96 }
+              ]
+            },
+            {
+              id: 'vrt_lh_3',
+              no: 3,
+              startDistanceM: 22.0,
+              depthM: 2.1,
+              bedNote: '右岸缓流，细砂',
+              points: [
+                { id: 'pnt_lh_31', relativeDepth: 0.2, velocityMs: 0.82 },
+                { id: 'pnt_lh_32', relativeDepth: 0.8, velocityMs: 0.64 }
+              ]
+            }
+          ]
         },
         {
           id: 'sec_lh_2407',
-          stationId: 'stn_lh01',
           measureNo: '2024-07-002',
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
-          measuredAt: '2024-07-18T09:10:00.000Z'
+          measuredAt: '2024-07-18T09:10:00.000Z',
+          targetLineNo: 'A',
+          handoffStatus: 'accepted',
+          handoffNote: 'ADCP 走航断面，外业自报 ADCP，站上认定为 ADCP',
+          verticals: [
+            {
+              id: 'vrt_lh_4',
+              no: 1,
+              startDistanceM: 8.0,
+              depthM: 3.6,
+              bedNote: 'ADCP 走航断面，主槽左侧',
+              points: [
+                { id: 'pnt_lh_41', relativeDepth: 0.2, velocityMs: 1.72, durationS: 120 },
+                { id: 'pnt_lh_42', relativeDepth: 0.6, velocityMs: 1.52, durationS: 120 },
+                { id: 'pnt_lh_43', relativeDepth: 0.8, velocityMs: 1.24, durationS: 120 }
+              ]
+            },
+            {
+              id: 'vrt_lh_5',
+              no: 2,
+              startDistanceM: 18.0,
+              depthM: 4.2,
+              bedNote: 'ADCP 主泓',
+              points: [
+                { id: 'pnt_lh_51', relativeDepth: 0.2, velocityMs: 2.05, durationS: 120 },
+                { id: 'pnt_lh_52', relativeDepth: 0.6, velocityMs: 1.82, durationS: 120 },
+                { id: 'pnt_lh_53', relativeDepth: 0.8, velocityMs: 1.55, durationS: 120 }
+              ]
+            }
+          ]
+        },
+        {
+          id: 'sec_lh_2409',
+          measureNo: '2024-09-010',
+          startDistanceM: 12.5,
+          stageM: 6.58,
+          method: '流速仪',
+          measuredAt: '2024-09-15T08:00:00.000Z',
+          targetLineNo: 'A',
+          handoffStatus: 'draft',
+          handoffNote: '',
+          verticals: []
+        },
+        {
+          id: 'sec_lh_2410',
+          measureNo: '2024-10-011',
+          startDistanceM: 12.5,
+          stageM: 6.88,
+          method: '流速仪',
+          measuredAt: '2024-10-12T08:20:00.000Z',
+          targetLineNo: 'A',
+          handoffStatus: 'submitted',
+          handoffNote: '退水期加测，三点法，资料已自检，申请并入 A 线待站上认定测法',
+          verticals: [
+            {
+              id: 'vrt_lh_6',
+              no: 1,
+              startDistanceM: 7.0,
+              depthM: 3.0,
+              bedNote: '主槽左侧',
+              points: [
+                { id: 'pnt_lh_61', relativeDepth: 0.2, velocityMs: 1.62 },
+                { id: 'pnt_lh_62', relativeDepth: 0.6, velocityMs: 1.4 },
+                { id: 'pnt_lh_63', relativeDepth: 0.8, velocityMs: 1.14 }
+              ]
+            },
+            {
+              id: 'vrt_lh_7',
+              no: 2,
+              startDistanceM: 16.5,
+              depthM: 3.6,
+              bedNote: '主泓',
+              points: [
+                { id: 'pnt_lh_71', relativeDepth: 0.2, velocityMs: 1.96 },
+                { id: 'pnt_lh_72', relativeDepth: 0.6, velocityMs: 1.72 },
+                { id: 'pnt_lh_73', relativeDepth: 0.8, velocityMs: 1.46 }
+              ]
+            }
+          ]
         }
-      ],
-      verticals: [
-        { id: 'vrt_lh_1', sectionId: 'sec_lh_2406', no: 1, startDistanceM: 6.5, depthM: 1.4, pointCount: 2, bedNote: '左岸浅滩，砾石河床' },
-        { id: 'vrt_lh_2', sectionId: 'sec_lh_2406', no: 2, startDistanceM: 14.0, depthM: 3.2, pointCount: 3, bedNote: '主流，砂卵石' },
-        { id: 'vrt_lh_3', sectionId: 'sec_lh_2406', no: 3, startDistanceM: 22.0, depthM: 2.1, pointCount: 2, bedNote: '右岸缓流，细砂' },
-        { id: 'vrt_lh_4', sectionId: 'sec_lh_2407', no: 1, startDistanceM: 8.0, depthM: 3.8, pointCount: 3, bedNote: 'ADCP 走航断面，主槽' }
-      ],
-      points: [
-        { id: 'pnt_lh_11', verticalId: 'vrt_lh_1', relativeDepth: 0.2, velocityMs: 0.62, weight: 0.5, durationS: 100 },
-        { id: 'pnt_lh_12', verticalId: 'vrt_lh_1', relativeDepth: 0.8, velocityMs: 0.48, weight: 0.5, durationS: 100 },
-        { id: 'pnt_lh_21', verticalId: 'vrt_lh_2', relativeDepth: 0.2, velocityMs: 1.42, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_lh_22', verticalId: 'vrt_lh_2', relativeDepth: 0.6, velocityMs: 1.18, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_lh_23', verticalId: 'vrt_lh_2', relativeDepth: 0.8, velocityMs: 0.96, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_lh_31', verticalId: 'vrt_lh_3', relativeDepth: 0.2, velocityMs: 0.82, weight: 0.5, durationS: 100 },
-        { id: 'pnt_lh_32', verticalId: 'vrt_lh_3', relativeDepth: 0.8, velocityMs: 0.64, weight: 0.5, durationS: 100 },
-        { id: 'pnt_lh_41', verticalId: 'vrt_lh_4', relativeDepth: 0.2, velocityMs: 1.86, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_lh_42', verticalId: 'vrt_lh_4', relativeDepth: 0.6, velocityMs: 1.64, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_lh_43', verticalId: 'vrt_lh_4', relativeDepth: 0.8, velocityMs: 1.32, weight: 1 / 3, durationS: 120 }
       ]
     },
     {
@@ -198,40 +484,77 @@ export async function seedDemoData(): Promise<void> {
       sections: [
         {
           id: 'sec_qj_2405',
-          stationId: 'stn_qj02',
           measureNo: '2024-05-003',
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
-          measuredAt: '2024-05-22T07:50:00.000Z'
+          measuredAt: '2024-05-22T07:50:00.000Z',
+          targetLineNo: 'B',
+          handoffStatus: 'accepted',
+          handoffNote: '浮标中泓法',
+          verticals: [
+            {
+              id: 'vrt_qj_1',
+              no: 1,
+              startDistanceM: 2.4,
+              depthM: 1.1,
+              bedNote: '浮标上断面',
+              points: [
+                { id: 'pnt_qj_11', relativeDepth: 0.2, velocityMs: 0.62 },
+                { id: 'pnt_qj_12', relativeDepth: 0.8, velocityMs: 0.48 }
+              ]
+            },
+            {
+              id: 'vrt_qj_2',
+              no: 2,
+              startDistanceM: 6.8,
+              depthM: 1.9,
+              bedNote: '浮标中泓',
+              points: [
+                { id: 'pnt_qj_21', relativeDepth: 0.2, velocityMs: 0.96 },
+                { id: 'pnt_qj_22', relativeDepth: 0.8, velocityMs: 0.78 }
+              ]
+            }
+          ]
         },
         {
           id: 'sec_qj_2408',
-          stationId: 'stn_qj02',
           measureNo: '2024-08-004',
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
-          measuredAt: '2024-08-09T06:40:00.000Z'
+          measuredAt: '2024-08-09T06:40:00.000Z',
+          targetLineNo: 'B',
+          handoffStatus: 'returned',
+          handoffNote: '涨水期加测，申请并入 B 线',
+          returnReason: '测点流速历时偏短（100s）且 0.8 水深流速异常，请复测后重新交回',
+          verticals: [
+            {
+              id: 'vrt_qj_3',
+              no: 1,
+              startDistanceM: 3.1,
+              depthM: 1.6,
+              bedNote: '涨水期，流速仪三点法',
+              points: [
+                { id: 'pnt_qj_31', relativeDepth: 0.2, velocityMs: 1.18 },
+                { id: 'pnt_qj_32', relativeDepth: 0.6, velocityMs: 1.02 },
+                { id: 'pnt_qj_33', relativeDepth: 0.8, velocityMs: 0.86 }
+              ]
+            },
+            {
+              id: 'vrt_qj_4',
+              no: 2,
+              startDistanceM: 7.6,
+              depthM: 2.4,
+              bedNote: '主槽，卵石夹砂',
+              points: [
+                { id: 'pnt_qj_41', relativeDepth: 0.2, velocityMs: 1.42 },
+                { id: 'pnt_qj_42', relativeDepth: 0.6, velocityMs: 1.26 },
+                { id: 'pnt_qj_43', relativeDepth: 0.8, velocityMs: 1.08 }
+              ]
+            }
+          ]
         }
-      ],
-      verticals: [
-        { id: 'vrt_qj_1', sectionId: 'sec_qj_2405', no: 1, startDistanceM: 2.4, depthM: 1.1, pointCount: 2, bedNote: '浮标上断面' },
-        { id: 'vrt_qj_2', sectionId: 'sec_qj_2405', no: 2, startDistanceM: 6.8, depthM: 1.9, pointCount: 2, bedNote: '浮标中泓' },
-        { id: 'vrt_qj_3', sectionId: 'sec_qj_2408', no: 1, startDistanceM: 3.1, depthM: 1.6, pointCount: 3, bedNote: '涨水期，流速仪三点法' },
-        { id: 'vrt_qj_4', sectionId: 'sec_qj_2408', no: 2, startDistanceM: 7.6, depthM: 2.4, pointCount: 3, bedNote: '主槽，卵石夹砂' }
-      ],
-      points: [
-        { id: 'pnt_qj_11', verticalId: 'vrt_qj_1', relativeDepth: 0.2, velocityMs: 0.54, weight: 0.5, durationS: 100 },
-        { id: 'pnt_qj_12', verticalId: 'vrt_qj_1', relativeDepth: 0.8, velocityMs: 0.42, weight: 0.5, durationS: 100 },
-        { id: 'pnt_qj_21', verticalId: 'vrt_qj_2', relativeDepth: 0.2, velocityMs: 0.88, weight: 0.5, durationS: 100 },
-        { id: 'pnt_qj_22', verticalId: 'vrt_qj_2', relativeDepth: 0.8, velocityMs: 0.7, weight: 0.5, durationS: 100 },
-        { id: 'pnt_qj_31', verticalId: 'vrt_qj_3', relativeDepth: 0.2, velocityMs: 1.06, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_qj_32', verticalId: 'vrt_qj_3', relativeDepth: 0.6, velocityMs: 0.92, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_qj_33', verticalId: 'vrt_qj_3', relativeDepth: 0.8, velocityMs: 0.78, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_qj_41', verticalId: 'vrt_qj_4', relativeDepth: 0.2, velocityMs: 1.34, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_qj_42', verticalId: 'vrt_qj_4', relativeDepth: 0.6, velocityMs: 1.2, weight: 1 / 3, durationS: 100 },
-        { id: 'pnt_qj_43', verticalId: 'vrt_qj_4', relativeDepth: 0.8, velocityMs: 1.04, weight: 1 / 3, durationS: 100 }
       ]
     },
     {
@@ -246,117 +569,254 @@ export async function seedDemoData(): Promise<void> {
       sections: [
         {
           id: 'sec_bs_2406',
-          stationId: 'stn_bs03',
           measureNo: '2024-06-005',
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
-          measuredAt: '2024-06-20T10:05:00.000Z'
+          measuredAt: '2024-06-20T10:05:00.000Z',
+          targetLineNo: 'C',
+          handoffStatus: 'accepted',
+          handoffNote: 'ADCP 比测次',
+          verticals: [
+            {
+              id: 'vrt_bs_1',
+              no: 1,
+              startDistanceM: 10.0,
+              depthM: 2.6,
+              bedNote: 'ADCP 左半断面',
+              points: [
+                { id: 'pnt_bs_11', relativeDepth: 0.2, velocityMs: 1.30, durationS: 120 },
+                { id: 'pnt_bs_12', relativeDepth: 0.6, velocityMs: 1.14, durationS: 120 },
+                { id: 'pnt_bs_13', relativeDepth: 0.8, velocityMs: 0.96, durationS: 120 }
+              ]
+            },
+            {
+              id: 'vrt_bs_2',
+              no: 2,
+              startDistanceM: 24.0,
+              depthM: 3.4,
+              bedNote: 'ADCP 右半断面',
+              points: [
+                { id: 'pnt_bs_21', relativeDepth: 0.2, velocityMs: 1.52, durationS: 120 },
+                { id: 'pnt_bs_22', relativeDepth: 0.6, velocityMs: 1.36, durationS: 120 },
+                { id: 'pnt_bs_23', relativeDepth: 0.8, velocityMs: 1.12, durationS: 120 }
+              ]
+            }
+          ]
         }
-      ],
-      verticals: [
-        { id: 'vrt_bs_1', sectionId: 'sec_bs_2406', no: 1, startDistanceM: 10.0, depthM: 2.6, pointCount: 3, bedNote: 'ADCP 左半断面' },
-        { id: 'vrt_bs_2', sectionId: 'sec_bs_2406', no: 2, startDistanceM: 24.0, depthM: 3.4, pointCount: 3, bedNote: 'ADCP 右半断面' }
-      ],
-      points: [
-        { id: 'pnt_bs_11', verticalId: 'vrt_bs_1', relativeDepth: 0.2, velocityMs: 1.22, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_bs_12', verticalId: 'vrt_bs_1', relativeDepth: 0.6, velocityMs: 1.08, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_bs_13', verticalId: 'vrt_bs_1', relativeDepth: 0.8, velocityMs: 0.9, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_bs_21', verticalId: 'vrt_bs_2', relativeDepth: 0.2, velocityMs: 1.46, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_bs_22', verticalId: 'vrt_bs_2', relativeDepth: 0.6, velocityMs: 1.3, weight: 1 / 3, durationS: 120 },
-        { id: 'pnt_bs_23', verticalId: 'vrt_bs_2', relativeDepth: 0.8, velocityMs: 1.1, weight: 1 / 3, durationS: 120 }
       ]
     }
   ]
 
-  // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线
-  const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt'>> = [
-    { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
-    { id: 'rat_lh_a2', stationId: 'stn_lh01', stageM: 4.52, flowM3s: 138.7, lineNo: 'A', measureNo: '2024-05-002', measuredAt: '2024-05-16T08:00:00.000Z' },
-    { id: 'rat_lh_a3', stationId: 'stn_lh01', stageM: 5.42, flowM3s: 217.2, lineNo: 'A', measureNo: '2024-06-001', measuredAt: '2024-06-12T08:30:00.000Z' },
-    { id: 'rat_lh_a4', stationId: 'stn_lh01', stageM: 6.15, flowM3s: 298.5, lineNo: 'A', measureNo: '2024-07-002', measuredAt: '2024-07-18T09:10:00.000Z' },
-    { id: 'rat_lh_a5', stationId: 'stn_lh01', stageM: 7.03, flowM3s: 428.1, lineNo: 'A', measureNo: '2024-08-006', measuredAt: '2024-08-21T08:20:00.000Z' },
-    { id: 'rat_qj_b1', stationId: 'stn_qj02', stageM: 2.84, flowM3s: 42.3, lineNo: 'B', measureNo: '2023-05-001', measuredAt: '2023-05-11T07:30:00.000Z' },
-    { id: 'rat_qj_b2', stationId: 'stn_qj02', stageM: 3.18, flowM3s: 56.1, lineNo: 'B', measureNo: '2024-05-003', measuredAt: '2024-05-22T07:50:00.000Z' },
-    { id: 'rat_qj_b3', stationId: 'stn_qj02', stageM: 3.72, flowM3s: 78.4, lineNo: 'B', measureNo: '2024-07-001', measuredAt: '2024-07-02T08:10:00.000Z' },
-    { id: 'rat_qj_b4', stationId: 'stn_qj02', stageM: 4.36, flowM3s: 115.6, lineNo: 'B', measureNo: '2024-08-004', measuredAt: '2024-08-09T06:40:00.000Z' },
-    // C 线：含两个明显偏离点，用于演示超限挂红与偏差分析
-    { id: 'rat_bs_c1', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 168.0, lineNo: 'C', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
-    { id: 'rat_bs_c2', stationId: 'stn_bs03', stageM: 5.36, flowM3s: 203.5, lineNo: 'C', measureNo: '2024-06-005', measuredAt: '2024-06-20T10:05:00.000Z' },
-    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 325.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
-    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
+  // 历史遗留点据（无对应测次，站上手工整编的早期点据；各线补足定线点数，
+  // 流量量级与外业部分面积法实算成果一致，保证幂函数定线有效）
+  const legacyRatingSpecs: Array<Omit<Rating, 'side' | 'sectionId' | 'determinedMethod' | 'publishedVersionId' | 'createdAt' | 'updatedAt'>> = [
+    { id: 'rat_lh_a0', stationId: 'stn_lh01', stageM: 4.62, flowM3s: 18.0, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
+    { id: 'rat_qj_b0', stationId: 'stn_qj02', stageM: 2.5, flowM3s: 2.6, lineNo: 'B', measureNo: '2023-05-001', measuredAt: '2023-05-11T07:30:00.000Z' },
+    { id: 'rat_bs_c0', stationId: 'stn_bs03', stageM: 4.9, flowM3s: 32.0, lineNo: 'C', measureNo: '2024-05-004', measuredAt: '2024-05-28T09:00:00.000Z' },
+    { id: 'rat_bs_c3', stationId: 'stn_bs03', stageM: 5.88, flowM3s: 82.0, lineNo: 'C', measureNo: '2024-07-007', measuredAt: '2024-07-25T09:30:00.000Z' },
+    { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 66.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points],
     async () => {
-      const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
-        createdAt: now + row.id.length,
-        updatedAt: now + row.id.length
-      })
-
       await db.stations.bulkPut(
-        stationBundles.map((bundle) => ({ ...bundle.station, ...stamp(bundle.station) }))
+        stationBundles.map((bundle) => {
+          const station: Station = {
+            ...bundle.station,
+            side: 'station',
+            createdAt: now,
+            updatedAt: now
+          }
+          return station
+        })
       )
-      await db.sections.bulkPut(
-        stationBundles.flatMap((bundle) =>
-          bundle.sections.map((section) => ({ ...section, ...stamp(section) }))
-        )
-      )
-      await db.verticals.bulkPut(
-        stationBundles.flatMap((bundle) =>
-          bundle.verticals.map((vertical) => ({ ...vertical, ...stamp(vertical) }))
-        )
-      )
-      await db.points.bulkPut(
-        stationBundles.flatMap((bundle) =>
-          bundle.points.map((point) => ({ ...point, ...stamp(point) }))
-        )
-      )
-      await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
 
-      // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
-      const compares: Compare[] = []
-      const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
-      ratingSeeds.forEach((rating) => {
-        const list = lineGroups.get(rating.lineNo) ?? []
-        list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
-        lineGroups.set(rating.lineNo, list)
-      })
-      ratingSeeds.forEach((rating) => {
-        const fit = fitPowerCurve(lineGroups.get(rating.lineNo) ?? [], rating.lineNo)
-        if (!fit.valid) return
-        const predicted = round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
-        const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
-        compares.push({
-          id: `cmp_${rating.id}`,
-          ratingId: rating.id,
-          measuredFlow: rating.flowM3s,
-          curveFlow: predicted,
-          deviationPct,
-          verdict: judgeDeviation(deviationPct),
-          operator: rating.lineNo === 'C' ? '周渝' : '林昭',
-          comparedAt: rating.measuredAt,
-          createdAt: now,
-          updatedAt: now
-        })
-      })
-      await db.compares.bulkPut(compares)
-      if (compares.length === 0) {
-        await db.compares.put({
-          id: 'cmp_fallback',
-          ratingId: 'rat_lh_a1',
-          measuredFlow: 97.5,
-          curveFlow: 100.2,
-          deviationPct: calcDeviationPct(97.5, 100.2),
-          verdict: judgeDeviation(calcDeviationPct(97.5, 100.2)),
-          operator: '林昭',
-          comparedAt: iso,
-          createdAt: now,
-          updatedAt: now
-        })
+      for (const bundle of stationBundles) {
+        for (const spec of bundle.sections) {
+          const stamp = now + spec.id.length
+          const accepted = spec.handoffStatus === 'accepted'
+          const section: Section = {
+            id: spec.id,
+            stationId: bundle.station.id,
+            measureNo: spec.measureNo,
+            startDistanceM: spec.startDistanceM,
+            stageM: spec.stageM,
+            method: spec.method,
+            measuredAt: spec.measuredAt,
+            side: 'field',
+            handoffStatus: spec.handoffStatus,
+            fieldFlowM3s: 0,
+            fieldAreaM2: 0,
+            fieldMeanVelocityMs: 0,
+            targetLineNo: spec.targetLineNo,
+            handedAt: spec.handoffStatus === 'draft' ? null : spec.measuredAt,
+            handoffNote: spec.handoffNote ?? '',
+            returnedAt: spec.handoffStatus === 'returned' ? spec.measuredAt : null,
+            returnReason: spec.returnReason ?? '',
+            returnCount: spec.handoffStatus === 'returned' ? 1 : 0,
+            // 播种时站上已对已采用测次完成测法认定（测法听站上；外业自报仅作记录）
+            determinedMethod: accepted ? spec.method : null,
+            determinedAt: accepted ? spec.measuredAt : null,
+            determinedBy: accepted ? '林昭' : '',
+            determinationNote: accepted ? '复核认定与外业记录一致' : '',
+            acceptedLineNo: accepted ? spec.targetLineNo : '',
+            acceptedVersionId: null,
+            acceptedAt: accepted ? spec.measuredAt : null,
+            createdAt: stamp,
+            updatedAt: stamp
+          }
+          await db.sections.put(section)
+
+          const verticals: Vertical[] = []
+          const points: Point[] = []
+          spec.verticals.forEach((verticalSpec) => {
+            const count = verticalSpec.points.length
+            verticals.push({
+              id: verticalSpec.id,
+              sectionId: spec.id,
+              no: verticalSpec.no,
+              startDistanceM: verticalSpec.startDistanceM,
+              depthM: verticalSpec.depthM,
+              pointCount: count,
+              bedNote: verticalSpec.bedNote,
+              side: 'field',
+              createdAt: stamp + verticalSpec.no,
+              updatedAt: stamp + verticalSpec.no
+            })
+            verticalSpec.points.forEach((pointSpec, index) => {
+              points.push({
+                id: pointSpec.id,
+                verticalId: verticalSpec.id,
+                relativeDepth: pointSpec.relativeDepth,
+                velocityMs: pointSpec.velocityMs,
+                weight: pointWeight(count),
+                durationS: pointSpec.durationS ?? 100,
+                side: 'field',
+                createdAt: stamp + index,
+                updatedAt: stamp + index
+              })
+            })
+          })
+          if (verticals.length > 0) await db.verticals.bulkPut(verticals)
+          if (points.length > 0) await db.points.bulkPut(points)
+        }
       }
+    }
+  )
+
+  // 第二阶段：按已落库垂线/测点重算外业流量快照，并由站上接收已采用测次为点据、发布三线 v1
+  const [allSections, allVerticals, allPoints] = await Promise.all([
+    db.sections.toArray(),
+    db.verticals.toArray(),
+    db.points.toArray()
+  ])
+
+  const pointsOfVertical = (verticalId: string): Point[] =>
+    allPoints
+      .filter((point) => point.verticalId === verticalId)
+      .sort((a, b) => a.relativeDepth - b.relativeDepth)
+
+  const acceptedRatingSpecs: Array<{ section: Section; flow: number }> = []
+
+  await db.transaction(
+    'rw',
+    [db.sections, db.ratings, db.compares, db.ratingVersions],
+    async () => {
+      for (const section of allSections) {
+        const verticals = allVerticals
+          .filter((vertical) => vertical.sectionId === section.id)
+          .sort((a, b) => a.startDistanceM - b.startDistanceM)
+        const result = calcSectionDischarge(
+          verticals.map((vertical) => ({
+            id: vertical.id,
+            no: vertical.no,
+            startDistanceM: vertical.startDistanceM,
+            depthM: vertical.depthM,
+            meanVelocityMs: calcMeanVelocity(
+              pointsOfVertical(vertical.id).map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+            )
+          }))
+        )
+        await db.sections.update(section.id, {
+          fieldFlowM3s: result.flowM3s,
+          fieldAreaM2: result.areaM2,
+          fieldMeanVelocityMs: result.meanVelocityMs,
+          updatedAt: Date.now()
+        } as never)
+        if (section.handoffStatus === 'accepted') {
+          acceptedRatingSpecs.push({ section, flow: result.flowM3s })
+        }
+      }
+
+      const ratings: Rating[] = [
+        ...legacyRatingSpecs.map((spec) => ({
+          ...spec,
+          side: 'station' as const,
+          sectionId: null,
+          determinedMethod: null,
+          publishedVersionId: null,
+          createdAt: now,
+          updatedAt: now
+        })),
+        ...acceptedRatingSpecs.map(({ section, flow }) => ({
+          id: `rat_${section.id}`,
+          stationId: section.stationId,
+          stageM: section.stageM,
+          flowM3s: round(flow, 1),
+          lineNo: section.acceptedLineNo,
+          measureNo: section.measureNo,
+          measuredAt: section.measuredAt,
+          side: 'station' as const,
+          sectionId: section.id,
+          determinedMethod: section.determinedMethod,
+          publishedVersionId: null,
+          createdAt: now,
+          updatedAt: now
+        }))
+      ]
+      await db.ratings.bulkPut(ratings)
+
+      // 逐定线号发布 v1：站上拿全部点据重新拟合，冻结点据与比测
+      const lineNos = Array.from(new Set(ratings.map((rating) => rating.lineNo))).sort()
+      const versions: RatingVersion[] = []
+      const compares: Compare[] = []
+      for (const lineNo of lineNos) {
+        const versionId = `ver_${lineNo.toLowerCase()}_1`
+        const lineRatings = ratings.filter((rating) => rating.lineNo === lineNo)
+        const assembled = assemblePublishedVersion({
+          id: versionId,
+          lineNo,
+          versionNo: 1,
+          ratings: lineRatings,
+          sourceSectionIds: acceptedRatingSpecs
+            .filter(({ section }) => section.acceptedLineNo === lineNo)
+            .map(({ section }) => section.id),
+          publishedBy: lineNo === 'C' ? '周渝' : '林昭',
+          reviewNote: '播种：复核通过后发布的首版定线',
+          deviationLimitPct: DEVIATION_LIMIT_PCT,
+          publishedAt: iso,
+          now
+        })
+        versions.push(assembled.version)
+        compares.push(...assembled.compares)
+        await db.ratings
+          .where('lineNo')
+          .equals(lineNo)
+          .modify((rating: Rating) => {
+            rating.publishedVersionId = versionId
+          })
+        await db.sections
+          .where('acceptedLineNo')
+          .equals(lineNo)
+          .modify((section: Section) => {
+            section.acceptedVersionId = versionId
+          })
+      }
+      await db.ratingVersions.bulkPut(versions)
+      await db.compares.bulkPut(compares)
     }
   )
 }
@@ -375,7 +835,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.ratingVersions],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +843,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.ratingVersions.clear()
       ])
     }
   )
@@ -397,15 +858,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, ratingVersions] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.ratingVersions.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, ratingVersions }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

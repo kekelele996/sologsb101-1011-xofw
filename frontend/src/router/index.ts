@@ -7,6 +7,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
  */
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/stations' },
+  { path: '/sections', redirect: '/stations' },
   {
     path: '/stations',
     name: 'station-list',
@@ -35,7 +36,13 @@ const routes: RouteRecordRaw[] = [
     path: '/ratings',
     name: 'rating-chart',
     component: () => import('@/pages/RatingChart.vue'),
-    meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
+    meta: { title: '水位流量关系点据', icon: 'TrendCharts', side: 'station' }
+  },
+  {
+    path: '/review',
+    name: 'review-desk',
+    component: () => import('@/pages/ReviewDesk.vue'),
+    meta: { title: '测次复核与测法认定', icon: 'CircleCheck', side: 'station' }
   },
   {
     path: '/export',

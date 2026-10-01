@@ -110,9 +110,9 @@ export const useStationStore = defineStore('station', () => {
     return stations.value.find((station) => station.id === id) ?? null
   }
 
-  async function createStation(payload: Omit<Station, 'id' | 'createdAt' | 'updatedAt'>): Promise<Station> {
+  async function createStation(payload: Omit<Station, 'id' | 'side' | 'createdAt' | 'updatedAt'>): Promise<Station> {
     const now = Date.now()
-    const row: Station = { ...payload, id: createId('stn'), createdAt: now, updatedAt: now }
+    const row: Station = { ...payload, side: 'station', id: createId('stn'), createdAt: now, updatedAt: now }
     await db.stations.put(row)
     return row
   }
@@ -121,11 +121,11 @@ export const useStationStore = defineStore('station', () => {
     await db.stations.update(id, { ...patch, updatedAt: Date.now() } as never)
   }
 
-  /** 删除测站：级联删除其断面、垂线、测点、点据与比测记录 */
+  /** 删除测站：级联删除其断面、垂线、测点、点据、比测记录与主属定线版本 */
   async function removeStation(id: string): Promise<void> {
     await db.transaction(
       'rw',
-      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.ratingVersions],
       async () => {
         const sectionIds = (await db.sections.where('stationId').equals(id).toArray()).map((row) => row.id)
         const verticalIds =
@@ -144,6 +144,8 @@ export const useStationStore = defineStore('station', () => {
           await db.compares.where('ratingId').anyOf(ratingIds).delete()
           await db.ratings.where('stationId').equals(id).delete()
         }
+        // 仅主属该站的版本随站删除；多站共用定线号的历史版本保留可查
+        await db.ratingVersions.where('stationId').equals(id).delete()
         await db.stations.delete(id)
       }
     )

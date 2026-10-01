@@ -1,11 +1,14 @@
-/** 水位流量关系点据：参与幂函数定线的实测点 */
+/** 水位流量关系点据：参与幂函数定线的实测点（站上侧整编成果） */
+import type { MeasureMethod } from './section'
+import type { WorkSide } from './side'
+
 export interface Rating {
   id: string
   /** 所属测站 */
   stationId: string
-  /** 水位（m） */
+  /** 水位（m）——取自交回测次的外业实测水位，站上不改 */
   stageM: number
-  /** 流量（m³/s） */
+  /** 流量（m³/s）——取自外业部分面积法成果，流量按外业算，站上不改 */
   flowM3s: number
   /** 定线号：同一定线号的点据参与同一组拟合 */
   lineNo: string
@@ -13,6 +16,14 @@ export interface Rating {
   measureNo: string
   /** 点据时间 */
   measuredAt: string
+  /** 归属侧：点据整编与发布归站上，升级旧库时补 station */
+  side: WorkSide
+  /** 来源测次 id：测次交回通过后由站上据此 upsert；历史遗留点据为 null */
+  sectionId: string | null
+  /** 该点据采用的测法（取自站上认定），未认定的历史点据为 null */
+  determinedMethod: MeasureMethod | null
+  /** 最近一次被纳入发布的定线版本 id（null 表示尚未随版发布） */
+  publishedVersionId: string | null
   createdAt: number
   updatedAt: number
 }

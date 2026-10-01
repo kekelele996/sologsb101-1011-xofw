@@ -146,3 +146,29 @@ export function powerFlow(a: number, b: number, h0: number, stageM: number): num
   if (!Number.isFinite(a) || !Number.isFinite(b)) return 0
   return round(a * Math.pow(Math.max(stageM - h0, 1e-6), b), 2)
 }
+
+/** 断面流量汇总输入：垂线 + 该垂线全部测点（外业成果） */
+export interface SectionFlowRows {
+  no: number
+  startDistanceM: number
+  depthM: number
+  points: Array<{ velocityMs: number; weight?: number }>
+}
+
+/**
+ * 由垂线与其测点直接汇总断面流量：
+ * 先逐垂线按测点权重算平均流速，再走部分面积法。
+ * db 播种时固化外业流量快照、外业交回时复核流量都用这一个入口。
+ */
+export function calcSectionFlow(rows: SectionFlowRows[]): DischargeResult {
+  return calcSectionDischarge(
+    rows
+      .map((row) => ({
+        id: `v${row.no}`,
+        no: row.no,
+        startDistanceM: row.startDistanceM,
+        depthM: row.depthM,
+        meanVelocityMs: calcMeanVelocity(row.points)
+      }))
+  )
+}
